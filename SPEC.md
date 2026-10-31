@@ -1,6 +1,6 @@
 # dklilo — Specification
 
-Status: **Draft v0.2**. Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.3** (L0-L3 implemented). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -407,6 +407,41 @@ Each milestone is merged only when all its acceptance criteria pass.
   first `dklilo.conf`, like Slackware's `liloconfig`.
 - **Done when:** on a fresh DKRescue install, `dklilo config` produces a
   configuration that `dklilo check` accepts and that boots.
+
+## 9a. Implementation notes (as built)
+
+Details settled while building L0-L3 that the sections above leave open.
+
+- **BIOS memory map.** Low memory: real-mode stack below `0x6F00`, the BIOS
+  call register block at `0x6F00`, stage 2 at `0x8000-0x87FFF`, a 32 KiB disk
+  bounce buffer at `0x88000`, `boot_params` at `0x90000`, the kernel command
+  line at `0x91000`. Above 1 MiB: kernel at `0x100000`, stack just below
+  `0x1F00000`, an 8 MiB heap at `0x2000000`. The initramfs goes as high as the
+  E820 map and `initrd_addr_max` allow, never below the end of the heap.
+  Machines need roughly 40 MiB of RAM or more.
+- **BIOS file loading** reads kernel and initramfs straight to their final
+  addresses; nothing buffers a whole file.
+- **Block list.** Stage 1 holds one extent (u64 LBA, u16 sector count) at MBR
+  offset 424, so stage 1 code must end before byte 424. On GPT disks stage 2
+  lives in a BIOS boot partition (type `21686148-6449-6E6F-744E-656564454649`).
+- **Menu.** A single entry with `timeout` set boots without showing the menu
+  unless `prompt` is given. `timeout = 0` always boots immediately.
+- **Console.** BIOS mirrors screen and COM1 (115200 8N1) and reads both; on
+  UEFI the firmware's console already includes serial. `serial =` is parsed
+  but only BIOS COM1 at 115200 is used so far.
+- **Config search** checks `/boot/dklilo.conf` then `/dklilo.conf` on every
+  partition of the boot disk (then any disk, on UEFI). Reading
+  `\EFI\dklilo\dklilo.conf` from the ESP needs the FAT reader, which is
+  still to do (needed by L5 and L7 as well).
+- **Testing kernel.** QEMU boot tests use a stock distribution kernel read from
+  `$DKLILO_KERNEL` (default `~/.cache/dklilo/vmlinuz`); it is never copied into
+  the repository, which ignores kernel and initramfs files. Tests skip when no
+  kernel is present. `tests/run-all.sh` runs everything.
+- **32-bit build.** The shared code is compiled for both 32-bit x86 (BIOS) and
+  64-bit targets, so `usize` is not `u64` in it; offsets are `u64` and
+  converted explicitly.
+- **LLVM quirk.** In `.code16` assembly `retf` encodes as the 32-bit `retfd`;
+  far transfers are written as explicit bytes (see `realmode.zig`).
 
 ## 10. Decisions
 
