@@ -78,4 +78,17 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests against real filesystem images");
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
+
+    // PID 1 for the Linux boot tests (tests/initramfs).
+    const init = b.addExecutable(.{
+        .name = "init",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/initramfs/init.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none }),
+            .optimize = .ReleaseSmall,
+            .single_threaded = true,
+            .strip = true,
+        }),
+    });
+    b.installArtifact(init);
 }

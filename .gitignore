@@ -1,2 +1,10 @@
 .zig-cache/
 zig-out/
+
+# Never commit kernels or initramfs images
+vmlinuz*
+bzImage*
+initramfs*
+initrd*
+*.deb
+tests/kernel/
