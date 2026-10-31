@@ -50,6 +50,7 @@ pub const Regs = extern struct {
 
 extern fn bios_int(vec: u32) callconv(.c) void;
 extern fn jump_kernel(entry: u32, boot_params: u32) callconv(.c) noreturn;
+extern fn chain_boot_sector(drive: u32, entry: u32) callconv(.c) noreturn;
 extern var boot_drive: u8;
 
 pub fn driveNumber() u8 {
@@ -69,6 +70,18 @@ pub fn int(vec: u8, in: Regs) Regs {
 /// `boot_params`, ebx = ebp = edi = 0, then jump to `entry`.
 pub fn startKernel(entry: u32, boot_params: u32) noreturn {
     jump_kernel(entry, boot_params);
+}
+
+/// Where a chainloaded boot sector is loaded, and where the copy of its MBR
+/// partition entry goes (ds:si points there, as an MBR would leave it).
+pub const boot_sector_addr = 0x7C00;
+pub const part_entry_addr = 0x7BE;
+
+/// Hands the machine to the boot sector already loaded at `boot_sector_addr`:
+/// back to real mode, dl = `drive`, ds:si = the partition entry, and a jump to
+/// 0000:7C00. Never returns.
+pub fn chainBootSector(drive: u8) noreturn {
+    chain_boot_sector(drive, part_entry_addr);
 }
 
 comptime {
@@ -204,6 +217,47 @@ comptime {
         \\   xor ebp, ebp
         \\   xor edi, edi
         \\   jmp eax
+        \\
+        \\ # void chain_boot_sector(uint32 drive, uint32 entry): to real mode,
+        \\ # then jump to the boot sector at 0000:7C00. Never returns.
+        \\ .global chain_boot_sector
+        \\ chain_boot_sector:
+        \\   mov eax, [esp + 4]
+        \\   mov [0x6F20], eax      # drive and entry survive the mode switch in
+        \\   mov eax, [esp + 8]     # low memory (registers are reloaded below)
+        \\   mov [0x6F24], eax
+        \\   cli
+        \\   .byte 0xEA
+        \\   .long pm16c
+        \\   .word 0x08
+        \\ .code16
+        \\ pm16c:
+        \\   mov ax, 0x20
+        \\   mov ds, ax
+        \\   mov es, ax
+        \\   mov fs, ax
+        \\   mov gs, ax
+        \\   mov ss, ax
+        \\   mov eax, cr0
+        \\   and eax, 0xFFFFFFFE
+        \\   mov cr0, eax
+        \\   .byte 0xEA
+        \\   .word rm16c, 0
+        \\ rm16c:
+        \\   xor ax, ax
+        \\   mov ds, ax
+        \\   mov es, ax
+        \\   mov fs, ax
+        \\   mov gs, ax
+        \\   mov ss, ax
+        \\   mov sp, 0x7C00         # the boot sector expects its stack below itself
+        \\   lidt [rm_idtr]
+        \\   mov dl, [0x6F20]
+        \\   mov si, [0x6F24]
+        \\   sti
+        \\   .byte 0xEA             # jmp 0000:7C00
+        \\   .word 0x7C00, 0
+        \\ .code32
         \\
         \\ .align 4
         \\ saved_esp: .long 0

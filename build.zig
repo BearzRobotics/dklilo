@@ -106,6 +106,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests against real filesystem images");
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
 
+    // A stand-in for Windows Boot Manager (tests/fake).
+    const fake_bootmgr = b.addExecutable(.{
+        .name = "fake-bootmgfw",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fake/bootmgfw.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .uefi, .abi = .msvc }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    b.installArtifact(fake_bootmgr);
+
     // PID 1 for the Linux boot tests (tests/initramfs).
     const init = b.addExecutable(.{
         .name = "init",

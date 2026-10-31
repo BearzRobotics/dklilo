@@ -7,6 +7,9 @@
 # With a third argument "gpt", the disk is GPT: stage 2 goes in a BIOS boot
 # partition (the MBR gap does not exist: LBA 1 is the GPT header).
 #
+# Set FAKE_WINDOWS=1 (mbr only) to add a second, NTFS-looking partition whose
+# boot sector is the fake from fake-ntfs-vbr.py.
+#
 # Usage: make-bios-disk.sh <out.img> <dklilo.conf> [mbr|gpt]
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -51,10 +54,15 @@ else
 label: dos
 label-id: 0x4a6f8c21
 start=2048, size=$root_sectors, type=83, bootable
+$([ -n "${FAKE_WINDOWS:-}" ] && echo "start=$((2048 + root_sectors)), size=4096, type=7")
 S
     stage2_lba=1
 fi
 dd if="$w/root.img" of="$out" bs=512 seek=2048 conv=notrunc,sparse 2>/dev/null
+if [ -n "${FAKE_WINDOWS:-}" ]; then
+    python3 "$here/tests/qemu/fake-ntfs-vbr.py" "$w/vbr.bin"
+    dd if="$w/vbr.bin" of="$out" bs=512 seek=$((2048 + root_sectors)) conv=notrunc 2>/dev/null
+fi
 python3 - "$here/zig-out/stage1.bin" "$here/zig-out/stage2.bin" "$out" "$stage2_lba" <<'PY'
 import sys, struct
 s1 = open(sys.argv[1], 'rb').read()

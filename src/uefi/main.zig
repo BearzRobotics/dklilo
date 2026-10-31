@@ -276,6 +276,59 @@ fn bootLinux(
     };
 }
 
+const SimpleFileSystem = uefi.protocol.SimpleFileSystem;
+
+/// Starts an EFI application stored on a FAT volume the firmware can read
+/// (normally the ESP). `windows` means Windows Boot Manager; anything else is
+/// taken as the path of an EFI file (`/` or `\\` separated). The image is
+/// loaded through its device path, not from memory, because boot managers
+/// find their own volume from it.
+fn chainEfi(target: []const u8) void {
+    const bs = uefi.system_table.boot_services.?;
+    const path8 = if (std.mem.eql(u8, target, "windows")) "\\EFI\\Microsoft\\Boot\\bootmgfw.efi" else target;
+
+    var path16: [256:0]u16 = undefined;
+    if (path8.len + 1 > path16.len) return;
+    var n: usize = 0;
+    if (path8.len == 0 or (path8[0] != '/' and path8[0] != '\\')) {
+        path16[0] = '\\';
+        n = 1;
+    }
+    for (path8) |c| {
+        path16[n] = if (c == '/') '\\' else c;
+        n += 1;
+    }
+    path16[n] = 0;
+
+    const handles = (bs.locateHandleBuffer(.{ .by_protocol = &SimpleFileSystem.guid }) catch null) orelse {
+        say("\r\nNo FAT volumes found.", .{});
+        return;
+    };
+    for (handles) |h| {
+        const sfs = (bs.handleProtocol(SimpleFileSystem, h) catch null) orelse continue;
+        const root = sfs.openVolume() catch continue;
+        const f = root.open(&path16, .read, .{}) catch {
+            root.close() catch {};
+            continue;
+        };
+        f.close() catch {};
+        root.close() catch {};
+
+        const dp = (bs.handleProtocol(DevicePath, h) catch null) orelse continue;
+        const full = dp.createFileDevicePath(allocator, path16[0..n]) catch continue;
+        say("\r\nStarting {s}...\r\n", .{path8});
+        const img = bs.loadImage(false, uefi.handle, .{ .device_path = full }) catch |e| {
+            say("\r\nLoadImage failed: {s}", .{@errorName(e)});
+            return;
+        };
+        _ = bs.startImage(img) catch |e| {
+            say("\r\nStartImage failed: {s}", .{@errorName(e)});
+        };
+        return;
+    }
+    say("\r\n{s} not found on any FAT volume.", .{path8});
+}
+
 pub fn main() void {
     const bs = uefi.system_table.boot_services.?;
     bs.setWatchdogTimer(0, 0, null) catch {};
@@ -331,7 +384,8 @@ pub fn main() void {
                     _ = con.getKey(null);
                 },
                 .chain => {
-                    say("\r\nWindows chainloading is not implemented yet. Press a key.", .{});
+                    chainEfi(entry.target);
+                    say("\r\nReturned to dklilo. Press a key.", .{});
                     _ = con.getKey(null);
                 },
             }

@@ -166,6 +166,47 @@ fn bootLinux(
     rm.startKernel(hdr.code32_start, rm.boot_params_addr);
 }
 
+// ---- chainloading ----------------------------------------------------------
+
+/// Loads another operating system's boot sector and jumps to it. `target` is
+/// `windows` (find the NTFS boot partition) or a partition number / device
+/// name ending in one (`2`, `/dev/sda2`) on the boot disk.
+fn chainload(set: *common.volumes.Set, target: []const u8) void {
+    const vol = if (std.mem.eql(u8, target, "windows"))
+        set.findWindowsBoot(0)
+    else blk: {
+        var end = target.len;
+        while (end > 0 and std.ascii.isDigit(target[end - 1])) end -= 1;
+        const n = std.fmt.parseInt(u8, target[end..], 10) catch break :blk null;
+        break :blk set.findPartition(0, n);
+    };
+    const v = vol orelse {
+        say("\r\nNo boot partition found for '{s}'.", .{target});
+        return;
+    };
+    const sector: *[512]u8 = @ptrFromInt(rm.boot_sector_addr);
+    v.region.readAt(0, sector) catch {
+        say("\r\nCannot read the boot sector.", .{});
+        return;
+    };
+    // A copy of the MBR partition entry for ds:si, as the MBR would leave it.
+    const entry: *[16]u8 = @ptrFromInt(rm.part_entry_addr);
+    entry.* = @splat(0);
+    entry[0] = if (v.bootable) 0x80 else 0;
+    entry[1] = 0xFE; // CHS fields: out of range, LBA fields are authoritative
+    entry[2] = 0xFF;
+    entry[3] = 0xFF;
+    entry[4] = v.mbr_type;
+    entry[5] = 0xFE;
+    entry[6] = 0xFF;
+    entry[7] = 0xFF;
+    const lba: u32 = @intCast(v.region.start / v.region.dev.sector_size);
+    std.mem.writeInt(u32, entry[8..12], lba, .little);
+    std.mem.writeInt(u32, entry[12..16], @intCast(v.region.len / v.region.dev.sector_size), .little);
+    con.clear();
+    rm.chainBootSector(rm.driveNumber());
+}
+
 // ---- main ----------------------------------------------------------------------
 
 fn manual(set: *common.volumes.Set, c: common.console.Console) void {
@@ -223,7 +264,7 @@ export fn stage2_main() callconv(.c) noreturn {
                             _ = c.getKey(null);
                         },
                         .chain => {
-                            say("\r\nChainloading is not implemented yet. Press a key.", .{});
+                            chainload(&set, entry.target);
                             _ = c.getKey(null);
                         },
                     }

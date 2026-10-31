@@ -31,6 +31,10 @@ truncate -s 33M "$w/esp.img"
 mkfs.fat -F 16 -n ESP "$w/esp.img" >/dev/null
 mmd -i "$w/esp.img" ::/EFI ::/EFI/BOOT
 mcopy -i "$w/esp.img" "$here/zig-out/bin/dkliloX64.efi" ::/EFI/BOOT/BOOTX64.EFI
+if [ -n "${FAKE_WINDOWS:-}" ]; then   # a stand-in Windows Boot Manager
+    mmd -i "$w/esp.img" ::/EFI/Microsoft ::/EFI/Microsoft/Boot
+    mcopy -i "$w/esp.img" "$here/zig-out/bin/fake-bootmgfw.efi" ::/EFI/Microsoft/Boot/bootmgfw.efi
+fi
 # ROOTFS=btrfs builds a zstd-compressed btrfs root with /boot as a subvolume
 # (needs mkfs.btrfs); the default is ext4.
 rootfs="${ROOTFS:-ext4}"

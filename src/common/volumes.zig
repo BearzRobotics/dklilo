@@ -25,8 +25,19 @@ pub const Volume = struct {
     part_guid: ?[16]u8 = null,
     /// MBR disk signature, if from an MBR disk.
     mbr_signature: ?u32 = null,
+    /// MBR partition type byte and active flag (0/false on GPT).
+    mbr_type: u8 = 0,
+    bootable: bool = false,
     state: enum { unprobed, open, none } = .unprobed,
     fs: fs_mod.Fs = undefined,
+
+    /// Does the volume start with an NTFS boot sector ("NTFS    " OEM id and
+    /// the 0x55AA signature)?
+    pub fn hasNtfsBootSector(v: *const Volume) bool {
+        var sec: [512]u8 = undefined;
+        v.region.readAt(0, &sec) catch return false;
+        return std.mem.eql(u8, sec[3..11], "NTFS    ") and sec[510] == 0x55 and sec[511] == 0xAA;
+    }
 
     /// The filesystem on this volume, or null if it has none we can read.
     pub fn filesystem(self: *Volume, allocator: std.mem.Allocator) ?*fs_mod.Fs {
@@ -80,6 +91,8 @@ pub const Set = struct {
                 .number = p.number,
                 .part_guid = if (table.kind == .gpt) p.part_guid else null,
                 .mbr_signature = if (table.kind == .mbr) table.disk_signature else null,
+                .mbr_type = p.mbr_type,
+                .bootable = p.bootable,
             });
         }
         return disk;
@@ -136,6 +149,25 @@ pub const Set = struct {
                 if (ino.is_regular) return .{ .vol = v, .path = p };
             }
         }
+        return null;
+    }
+
+    /// The partition to chainload for `other = windows` on BIOS: an NTFS
+    /// partition on `disk`, preferring the active one (Windows' boot partition
+    /// is normally active) and otherwise the first.
+    pub fn findWindowsBoot(self: *Set, disk: usize) ?*Volume {
+        var first: ?*Volume = null;
+        for (self.vols.items) |*v| {
+            if (v.disk != disk or v.number == 0 or !v.hasNtfsBootSector()) continue;
+            if (v.bootable) return v;
+            if (first == null) first = v;
+        }
+        return first;
+    }
+
+    /// The volume numbered `number` (as Linux numbers partitions) on `disk`.
+    pub fn findPartition(self: *Set, disk: usize, number: u8) ?*Volume {
+        for (self.vols.items) |*v| if (v.disk == disk and v.number == number) return v;
         return null;
     }
 
@@ -221,4 +253,27 @@ test "partitions of an MBR disk are listed, extended container skipped" {
     try std.testing.expectEqual(@as(u8, 5), set.vols.items[3].number);
     try std.testing.expectEqual(@as(?u32, 0x4a6f8c21), set.vols.items[0].mbr_signature);
     try std.testing.expect(set.findConfig(null) == null); // no filesystems here
+}
+
+test "Windows boot partition: the active NTFS boot sector wins" {
+    const copy = try std.testing.allocator.dupe(u8, @embedFile("mbr.img"));
+    defer std.testing.allocator.free(copy);
+    // Partition 2 (LBA 10240) and 3 (LBA 18432) get NTFS boot sectors; the
+    // active partition is 1, which has none, so the first NTFS one is used.
+    for ([_]usize{ 10240, 18432 }) |lba| {
+        const sec = copy[lba * 512 ..][0..512];
+        @memcpy(sec[3..11], "NTFS    ");
+        sec[510] = 0x55;
+        sec[511] = 0xAA;
+    }
+    var d = blockdev.MemDisk{ .data = copy };
+    var set = Set.init(std.testing.allocator);
+    defer set.deinit();
+    const disk = try set.addDisk(d.blockDev());
+    try std.testing.expectEqual(@as(u8, 2), set.findWindowsBoot(disk).?.number);
+    try std.testing.expectEqual(@as(u8, 3), set.findPartition(disk, 3).?.number);
+    try std.testing.expect(set.findPartition(disk, 9) == null);
+    // Make partition 3 active: it should win now.
+    set.vols.items[2].bootable = true;
+    try std.testing.expectEqual(@as(u8, 3), set.findWindowsBoot(disk).?.number);
 }
