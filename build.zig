@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const bin = b.addObjCopy(stage1.getEmittedBin(), .{ .format = .binary });
     b.getInstallStep().dependOn(&b.addInstallFile(bin.getOutput(), "stage1.bin").step);
 
+    const common = b.createModule(.{ .root_source_file = b.path("src/common/root.zig") });
     const stage2 = b.addExecutable(.{
         .name = "stage2.elf",
         .root_module = b.createModule(.{
@@ -37,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .single_threaded = true,
             .red_zone = false,
             .stack_protector = false,
+            .imports = &.{.{ .name = "common", .module = common }},
         }),
     });
     stage2.entry = .{ .symbol_name = "_start" };
@@ -44,7 +46,6 @@ pub fn build(b: *std.Build) void {
     const stage2_bin = b.addObjCopy(stage2.getEmittedBin(), .{ .format = .binary });
     b.getInstallStep().dependOn(&b.addInstallFile(stage2_bin.getOutput(), "stage2.bin").step);
 
-    const common = b.createModule(.{ .root_source_file = b.path("src/common/root.zig") });
     const efi = b.addExecutable(.{
         .name = "dkliloX64",
         .root_module = b.createModule(.{

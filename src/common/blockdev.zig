@@ -44,14 +44,14 @@ pub const BlockDev = struct {
         while (rest.len > 0) {
             const in_sector = off % ss;
             if (in_sector == 0 and rest.len >= ss) {
-                const aligned = rest.len - rest.len % ss;
+                const aligned: usize = rest.len - rest.len % self.sector_size;
                 try self.readSectors(off / ss, rest[0..aligned]);
                 off += aligned;
                 rest = rest[aligned..];
             } else {
-                try self.readSectors(off / ss, bounce[0..ss]);
-                const n = @min(rest.len, ss - in_sector);
-                @memcpy(rest[0..n], bounce[in_sector..][0..n]);
+                try self.readSectors(off / ss, bounce[0..self.sector_size]);
+                const n: usize = @intCast(@min(@as(u64, rest.len), ss - in_sector));
+                @memcpy(rest[0..n], bounce[@intCast(in_sector)..][0..n]);
                 off += n;
                 rest = rest[n..];
             }

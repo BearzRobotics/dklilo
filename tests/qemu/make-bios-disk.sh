@@ -1,0 +1,57 @@
+#!/bin/sh
+# Builds a BIOS-bootable MBR test disk the way the installer will: stage 1 in
+# the MBR code area (partition table kept), stage 2 at LBA 1 recorded in the
+# block list, and one ext4 partition with the kernel, initramfs and config.
+# The kernel is read from $DKLILO_KERNEL and only lives in the temp image.
+#
+# With a third argument "gpt", the disk is GPT: stage 2 goes in a BIOS boot
+# partition (the MBR gap does not exist: LBA 1 is the GPT header).
+#
+# Usage: make-bios-disk.sh <out.img> <dklilo.conf> [mbr|gpt]
+set -eu
+here=$(cd "$(dirname "$0")/../.." && pwd)
+out="$1"; conf="$2"; kind="${3:-mbr}"
+kernel="${DKLILO_KERNEL:-$HOME/.cache/dklilo/vmlinuz}"
+[ -f "$kernel" ] || { echo "SKIP: no kernel at $kernel (set DKLILO_KERNEL)"; exit 77; }
+w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
+
+python3 "$here/tests/initramfs/mkcpio.py" "$w/initrd1.cpio" --init "$here/zig-out/bin/init" --file marker1=from-initrd-1
+gzip -c "$w/initrd1.cpio" > "$w/initrd1.img"
+python3 "$here/tests/initramfs/mkcpio.py" "$w/initrd2.cpio" --file marker2=from-initrd-2
+
+mkdir -p "$w/root/boot"
+cp "$kernel" "$w/root/boot/vmlinuz"
+cp "$w/initrd1.img" "$w/root/boot/initrd1.img"
+cp "$w/initrd2.cpio" "$w/root/boot/initrd2.cpio"
+cp "$conf" "$w/root/boot/dklilo.conf"
+truncate -s 64M "$w/root.img"
+mkfs.ext4 -F -q -L dklroot -d "$w/root" "$w/root.img" >/dev/null 2>&1
+
+rm -f "$out"
+truncate -s 80M "$out"
+if [ "$kind" = gpt ]; then
+    sgdisk -o "$out" >/dev/null
+    sgdisk -a 1 -n 1:64:2047 -t 1:EF02 -n 2:2048:133119 -t 2:8300 "$out" >/dev/null 2>&1
+    stage2_lba=64
+else
+    sfdisk -q "$out" >/dev/null <<S
+label: dos
+label-id: 0x4a6f8c21
+start=2048, size=131072, type=83, bootable
+S
+    stage2_lba=1
+fi
+dd if="$w/root.img" of="$out" bs=512 seek=2048 conv=notrunc 2>/dev/null
+python3 - "$here/zig-out/stage1.bin" "$here/zig-out/stage2.bin" "$out" "$stage2_lba" <<'PY'
+import sys, struct
+s1 = open(sys.argv[1], 'rb').read()
+s2 = open(sys.argv[2], 'rb').read()
+sectors = (len(s2) + 511) // 512
+lba = int(sys.argv[4])
+assert lba + sectors <= 2048, "stage 2 does not fit before the first partition"
+code = bytearray(s1[:440])
+code[424:434] = struct.pack('<QH', lba, sectors)  # block list: where stage 2 lives
+with open(sys.argv[3], 'r+b') as f:
+    f.seek(0); f.write(code)                         # keeps the partition table and signature
+    f.seek(512 * lba); f.write(s2)
+PY

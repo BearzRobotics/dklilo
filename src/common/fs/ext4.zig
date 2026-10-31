@@ -508,7 +508,7 @@ pub const Fs = struct {
             try self.region.readAt(block * self.block_size, self.ind_buf);
             self.ind_block = block;
         }
-        return std.mem.readInt(u32, self.ind_buf[index * 4 ..][0..4], .little);
+        return std.mem.readInt(u32, self.ind_buf[@as(usize, @intCast(index * 4))..][0..4], .little);
     }
 
     fn mapBlockMap(self: *Fs, ino: *const Inode, lblock: u64) Error!Run {
