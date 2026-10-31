@@ -57,4 +57,25 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(efi);
+
+    // ---- tests: filesystem and partition readers against real images ----
+    const gen = b.addSystemCommand(&.{"sh"});
+    gen.addFileArg(b.path("tests/images/make-fixtures.sh"));
+    const fixtures = gen.addOutputDirectoryArg("fixtures");
+
+    const common_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/common/root.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    for ([_][]const u8{
+        "manifest.txt", "ext4.img",        "ext4-1k.img", "ext4-64bit.img", "ext3.img",
+        "ext2.img",     "ext4-inline.img", "mbr.img",     "gpt.img",
+    }) |name| {
+        common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = fixtures.path(b, name) });
+    }
+    const test_step = b.step("test", "Run unit tests against real filesystem images");
+    test_step.dependOn(&b.addRunArtifact(common_tests).step);
 }
