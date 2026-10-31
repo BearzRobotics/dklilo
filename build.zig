@@ -61,6 +61,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(efi);
 
+    // The installer embeds the boot images, so it is one static file.
+    const installer = b.addExecutable(.{
+        .name = "dklilo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/installer/main.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none }),
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "common", .module = common }},
+        }),
+    });
+    installer.root_module.addAnonymousImport("stage1.bin", .{ .root_source_file = bin.getOutput() });
+    installer.root_module.addAnonymousImport("stage2.bin", .{ .root_source_file = stage2_bin.getOutput() });
+    installer.root_module.addAnonymousImport("dkliloX64.efi", .{ .root_source_file = efi.getEmittedBin() });
+    b.installArtifact(installer);
+
     // Size limits from SPEC.md 5.1, enforced on every build.
     for ([_]struct { name: []const u8, file: std.Build.LazyPath }{
         .{ .name = "dkliloX64.efi", .file = efi.getEmittedBin() },
@@ -105,6 +120,16 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests against real filesystem images");
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
+
+    const installer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/installer/root.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "common", .module = common }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(installer_tests).step);
 
     // A stand-in for Windows Boot Manager (tests/fake).
     const fake_bootmgr = b.addExecutable(.{

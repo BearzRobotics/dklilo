@@ -91,6 +91,8 @@ comptime {
         \\ .intel_syntax noprefix
         \\ .global _start
         \\ _start:
+        \\   .byte 0xEB, 0x08       # jmp over the signature below; the installer
+        \\   .ascii "DKLILOS2"      # recognises an installed stage 2 by it
         \\   cli
         \\   xor ax, ax
         \\   mov ds, ax
