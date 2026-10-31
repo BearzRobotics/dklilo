@@ -7,6 +7,7 @@ const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
 const fs_mod = @import("fs/fs.zig");
+const iso9660 = @import("fs/iso9660.zig");
 
 pub const Error = error{
     /// A path prefix names a volume that isn't there.
@@ -78,7 +79,15 @@ pub const Set = struct {
     pub fn addDisk(self: *Set, dev: blockdev.BlockDev) std.mem.Allocator.Error!usize {
         const disk = self.disks;
         self.disks += 1;
+        // An ISO 9660 volume (a DVD, or a hybrid ISO written to a stick) is
+        // the whole device. On optical media (2048-byte sectors) that is all
+        // there is; on a hybrid disk the partitions follow below.
+        if (iso9660.isIso(dev.whole())) {
+            try self.vols.append(self.allocator, .{ .region = dev.whole(), .disk = disk, .number = 0 });
+            if (dev.sector_size >= 2048) return disk;
+        }
         const table = part.read(dev) catch {
+            if (self.vols.items.len > 0 and self.vols.items[self.vols.items.len - 1].disk == disk) return disk;
             try self.vols.append(self.allocator, .{ .region = dev.whole(), .disk = disk, .number = 0 });
             return disk;
         };

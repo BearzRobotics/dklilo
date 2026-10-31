@@ -74,7 +74,7 @@ sectors = (len(s2) + 511) // 512
 lba = int(sys.argv[4])
 assert lba + sectors <= 2048, "stage 2 does not fit before the first partition"
 code = bytearray(s1[:440])
-code[424:434] = struct.pack('<QH', lba, sectors)  # block list: where stage 2 lives
+code[416:426] = struct.pack('<QH', lba, sectors)  # block list: where stage 2 lives
 with open(sys.argv[3], 'r+b') as f:
     f.seek(0); f.write(code)                         # keeps the partition table and signature
     f.seek(512 * lba); f.write(s2)

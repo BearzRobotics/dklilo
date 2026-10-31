@@ -10,7 +10,7 @@ import sys, struct
 s1 = bytearray(open(sys.argv[1], 'rb').read())
 s2 = open(sys.argv[2], 'rb').read()
 sectors = (len(s2) + 511) // 512
-s1[424:434] = struct.pack('<QH', 1, sectors)      # block list: LBA 1, N sectors
+s1[416:426] = struct.pack('<QH', 1, sectors)      # block list: LBA 1, N sectors
 disk = bytearray(1024 * 1024)
 disk[0:512] = s1
 disk[512:512 + len(s2)] = s2

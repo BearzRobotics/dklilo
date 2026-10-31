@@ -2,7 +2,7 @@
 //! mode. It reads stage 2 from disk using the one extent recorded in the
 //! block list (written by the installer) and jumps to it at 0x0000:0x8000.
 //!
-//! Block list layout, at MBR offset 424 (see stage1.ld):
+//! Block list layout, at MBR offset 416 (see stage1.ld):
 //!   u64 start LBA, u16 sector count.
 
 comptime {

@@ -6,9 +6,9 @@ const std = @import("std");
 const common = @import("common");
 
 pub const sector_size = 512;
-/// Stage 1 lives in the first 440 bytes of the MBR; the block list sits at 424.
+/// Stage 1 lives in the first 440 bytes of the MBR; the block list sits at 416.
 pub const mbr_code_size = 440;
-pub const blocklist_offset = 424;
+pub const blocklist_offset = 416;
 /// Magic at offset 2 of an installed stage 2 (after a 2-byte jump).
 pub const stage2_magic = "DKLILOS2";
 
@@ -238,8 +238,8 @@ test "mbr: stage 2 goes at LBA 1, the partition table survives" {
     try testing.expectEqual(@as(u64, 1), plan.stage2_lba);
     try testing.expectEqual(@as(u32, 3), plan.stage2_sectors);
     // Block list.
-    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, plan.mbr[424..432], .little));
-    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, plan.mbr[432..434], .little));
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, plan.mbr[416..424], .little));
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, plan.mbr[424..426], .little));
     // Disk signature, partition table and 0x55AA are untouched.
     try testing.expectEqualSlices(u8, disk[440..512], plan.mbr[440..512]);
     try testing.expectEqual(@as(u8, 0x99), plan.mbr[100]);

@@ -79,6 +79,11 @@ else
     echo "note: mkfs.btrfs not found, skipping btrfs images" >&2
 fi
 
+# --- ISO 9660 with Rock Ridge (needs xorriso) ---------------------------------
+if command -v xorriso >/dev/null 2>&1; then
+    xorriso -as mkisofs -quiet -R -V DKLISO -o "$out/iso.img" "$t" >/dev/null 2>&1
+fi
+
 # --- partition tables -------------------------------------------------------
 truncate -s 64M "$out/mbr.img"
 sfdisk -q "$out/mbr.img" >/dev/null <<S

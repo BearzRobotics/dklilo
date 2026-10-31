@@ -11,6 +11,7 @@ pub const lzo = @import("compress/lzo.zig");
 pub const part = @import("part.zig");
 pub const btrfs = @import("fs/btrfs.zig");
 pub const fs = @import("fs/fs.zig");
+pub const iso9660 = @import("fs/iso9660.zig");
 pub const ext4 = @import("fs/ext4.zig");
 
 test {
@@ -25,6 +26,7 @@ test {
     _ = part;
     _ = btrfs;
     _ = fs;
+    _ = iso9660;
     _ = ext4;
     _ = @import("tests.zig");
 }

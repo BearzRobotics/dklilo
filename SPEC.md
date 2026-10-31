@@ -1,6 +1,6 @@
 # dklilo — Specification
 
-Status: **Draft v0.4** (L0-L4 implemented). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.5** (L0-L7 implemented). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -422,7 +422,7 @@ Details settled while building L0-L3 that the sections above leave open.
 - **BIOS file loading** reads kernel and initramfs straight to their final
   addresses; nothing buffers a whole file.
 - **Block list.** Stage 1 holds one extent (u64 LBA, u16 sector count) at MBR
-  offset 424, so stage 1 code must end before byte 424. On GPT disks stage 2
+  offset 416, so stage 1 code must end before byte 416. On GPT disks stage 2
   lives in a BIOS boot partition (type `21686148-6449-6E6F-744E-656564454649`).
 - **Menu.** A single entry with `timeout` set boots without showing the menu
   unless `prompt` is given. `timeout = 0` always boots immediately.
@@ -443,6 +443,19 @@ Details settled while building L0-L3 that the sections above leave open.
   selects one by its path under the top level. zstd extents are padded to a
   sector after the frame, so decoding stops at the first frame's end.
   Fixtures need `mkfs.btrfs` (btrfs-progs 6.x); tests skip btrfs without it.
+- **ISO.** `dklilo mkiso-images <dir>` writes `eltorito.bin` (a 2048-byte CD
+  boot sector followed by stage 2; the sector finds stage 2 through the boot
+  info table `xorriso -boot-info-table` fills in), `efiboot.img` (a 4 MiB FAT12
+  image holding `\EFI\BOOT\BOOTX64.EFI`) and `mbr.bin` (stage 1 for the hybrid
+  MBR). After `xorriso ... --grub2-mbr mbr.bin -b .../eltorito.bin
+  -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e
+  .../efiboot.img -no-emul-boot -append_partition 2 0xEF efiboot.img
+  -appended_part_as_gpt`, run `dklilo isohybrid out.iso` to point stage 1 at
+  stage 2 (it rewrites only the 10-byte block list). `tests/qemu/l7-iso.sh`
+  is the reference recipe. The block list is at MBR offset 416 (not 424)
+  because xorriso's GRUB2-style MBR option writes 8 bytes at offset 432.
+- **Disk scan.** A device with an ISO 9660 signature at block 16 is one
+  whole-device volume; on a hybrid USB disk the partitions are scanned too.
 - **32-bit build.** The shared code is compiled for both 32-bit x86 (BIOS) and
   64-bit targets, so `usize` is not `u64` in it; offsets are `u64` and
   converted explicitly.

@@ -22,6 +22,20 @@ pub fn build(b: *std.Build) void {
     const bin = b.addObjCopy(stage1.getEmittedBin(), .{ .format = .binary });
     b.getInstallStep().dependOn(&b.addInstallFile(bin.getOutput(), "stage1.bin").step);
 
+    // El Torito boot sector for the ISO: reads stage 2 from the next CD sector.
+    const cdstub = b.addExecutable(.{
+        .name = "cdstub.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bios/cdstub.zig"),
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .single_threaded = true,
+        }),
+    });
+    cdstub.entry = .{ .symbol_name = "_start" };
+    cdstub.setLinkerScript(b.path("src/bios/cdstub.ld"));
+    const cdstub_bin = b.addObjCopy(cdstub.getEmittedBin(), .{ .format = .binary });
+
     const common = b.createModule(.{ .root_source_file = b.path("src/common/root.zig") });
     const stage2 = b.addExecutable(.{
         .name = "stage2.elf",
@@ -72,6 +86,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     installer.root_module.addAnonymousImport("stage1.bin", .{ .root_source_file = bin.getOutput() });
+    installer.root_module.addAnonymousImport("cdstub.bin", .{ .root_source_file = cdstub_bin.getOutput() });
     installer.root_module.addAnonymousImport("stage2.bin", .{ .root_source_file = stage2_bin.getOutput() });
     installer.root_module.addAnonymousImport("dkliloX64.efi", .{ .root_source_file = efi.getEmittedBin() });
     b.installArtifact(installer);

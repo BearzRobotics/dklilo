@@ -422,3 +422,34 @@ test "btrfs: random metadata damage never crashes" {
         _ = fs.lookup("/many") catch {};
     }
 }
+
+// ---- ISO 9660 ------------------------------------------------------------
+
+test "iso9660 + Rock Ridge: every file matches" {
+    var d = try FileDisk.open("iso.img");
+    defer d.close();
+    var dev = d.blockDev();
+    dev.sector_size = 512;
+    try checkDisk(dev);
+}
+
+test "iso9660: label, symlinks, long names, big directory, case" {
+    var d = try FileDisk.open("iso.img");
+    defer d.close();
+    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    try std.testing.expectEqualStrings("DKLISO", fs.label());
+    // Rock Ridge symlinks (relative and absolute) resolve.
+    try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("/boot/link-fast")).size);
+    try std.testing.expectEqual(@as(u64, 7), (try fs.lookup("/boot/link-dir")).size);
+    try std.testing.expectEqual(@as(u64, 7), (try fs.lookup("/boot/link-abs")).size);
+    // 255-character name (needs NM continuation) and 3000-entry directory.
+    var long: [255]u8 = undefined;
+    @memset(&long, 'n');
+    var path_buf: [300]u8 = undefined;
+    const lp = try std.fmt.bufPrint(&path_buf, "/boot/sub/{s}", .{long});
+    try std.testing.expectEqual(@as(u64, 5), (try fs.lookup(lp)).size);
+    try std.testing.expectEqual(@as(u64, 5), (try fs.lookup("/many/file-with-a-longish-name-7")).size);
+    try std.testing.expectError(error.NotFound, fs.lookup("/boot/nope"));
+    try std.testing.expectError(error.NotDirectory, fs.lookup("/boot/hello.txt/x"));
+}

@@ -4,17 +4,20 @@
 //!   dklilo install-bios <disk> [--yes]
 //!   dklilo install-uefi <esp-dir> [--removable] [--entry-file F] [--device DEV] [--yes]
 //!   dklilo mkiso-images <dir>
+//!   dklilo isohybrid <iso>
 //!
 //! Every disk write is listed first and needs --yes or a typed confirmation.
 
 const std = @import("std");
 const common = @import("common");
 const plan = @import("plan.zig");
+const fat12 = @import("fat12.zig");
 
 const Io = std.Io;
 
 const stage1_image = @embedFile("stage1.bin");
 const stage2_image = @embedFile("stage2.bin");
+const cdstub_image = @embedFile("cdstub.bin");
 const efi_image = @embedFile("dkliloX64.efi");
 
 var io_global: Io = undefined;
@@ -39,6 +42,7 @@ fn usage() u8 {
         \\  dklilo install-bios <disk> [--yes]
         \\  dklilo install-uefi <esp-dir> [--removable] [--entry-file FILE] [--device DEV] [--yes]
         \\  dklilo mkiso-images <dir>
+        \\  dklilo isohybrid <iso>
         \\
     , .{});
     return 2;
@@ -449,6 +453,89 @@ fn checkFile(set: *common.volumes.Set, def: *common.volumes.Volume, label: []con
     }
 }
 
+// ---- ISO images ------------------------------------------------------------
+
+const cd_sector = 2048;
+
+/// Writes the three files `xorriso` needs to build a bootable hybrid ISO:
+///   eltorito.bin  El Torito BIOS image: a boot sector, then stage 2
+///   efiboot.img   FAT image holding \EFI\BOOT\BOOTX64.EFI
+///   mbr.bin       stage 1 as the 440-byte MBR code of the hybrid ISO
+fn mkisoImages(args: []const [:0]const u8) !u8 {
+    if (args.len != 1) return usage();
+    const dir_path: []const u8 = args[0];
+    var dir = Io.Dir.cwd().openDir(io_global, dir_path, .{}) catch |e| {
+        err("dklilo: cannot open {s}: {s}\n", .{ dir_path, @errorName(e) });
+        return 1;
+    };
+    defer dir.close(io_global);
+
+    // eltorito.bin: the boot sector, then stage 2 padded to CD sectors.
+    const s2_sectors = (stage2_image.len + cd_sector - 1) / cd_sector;
+    const el = try gpa_global.alloc(u8, cd_sector * (1 + s2_sectors));
+    defer gpa_global.free(el);
+    @memset(el, 0);
+    if (cdstub_image.len > cd_sector) return error.StubTooBig;
+    @memcpy(el[0..cdstub_image.len], cdstub_image);
+    std.mem.writeInt(u16, el[0x40..][0..2], @intCast(s2_sectors), .little);
+    @memcpy(el[cd_sector..][0..stage2_image.len], stage2_image);
+    try dir.writeFile(io_global, .{ .sub_path = "eltorito.bin", .data = el });
+
+    const efi = fat12.buildEfiImage(gpa_global, efi_image) catch |e| {
+        err("dklilo: cannot build the EFI image: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    defer gpa_global.free(efi);
+    try dir.writeFile(io_global, .{ .sub_path = "efiboot.img", .data = efi });
+    try dir.writeFile(io_global, .{ .sub_path = "mbr.bin", .data = stage1_image[0..plan.mbr_code_size] });
+    out("wrote eltorito.bin ({d} bytes), efiboot.img ({d} bytes), mbr.bin ({d} bytes) in {s}\n", .{ el.len, efi.len, plan.mbr_code_size, dir_path });
+    return 0;
+}
+
+/// Makes a built ISO bootable from a USB stick under BIOS: finds eltorito.bin
+/// through the El Torito boot catalog and points stage 1 (in the ISO's system
+/// area, installed there by `xorriso --grub2-mbr mbr.bin`) at the stage 2 that
+/// follows its boot sector. Only the 10-byte block list is rewritten.
+fn isohybrid(args: []const [:0]const u8) !u8 {
+    if (args.len != 1) return usage();
+    var dev = Device.open(args[0], true) catch |e| {
+        err("dklilo: cannot open {s}: {s}\n", .{ args[0], @errorName(e) });
+        return 1;
+    };
+    defer dev.close();
+
+    var vd: [cd_sector]u8 = undefined;
+    try dev.readAt(17 * cd_sector, &vd);
+    if (vd[0] != 0 or !std.mem.eql(u8, vd[1..6], "CD001") or !std.mem.startsWith(u8, vd[7..], "EL TORITO SPECIFICATION")) {
+        err("dklilo: {s} has no El Torito boot record; build it with xorriso -b ... first\n", .{args[0]});
+        return 1;
+    }
+    const catalog = std.mem.readInt(u32, vd[71..75], .little);
+    var cat: [cd_sector]u8 = undefined;
+    try dev.readAt(@as(u64, catalog) * cd_sector, &cat);
+    // Validation entry, then the default (BIOS) entry.
+    if (cat[0] != 1 or cat[30] != 0x55 or cat[31] != 0xAA or cat[32] != 0x88) {
+        err("dklilo: unexpected boot catalog layout\n", .{});
+        return 1;
+    }
+    const rba = std.mem.readInt(u32, cat[32 + 8 ..][0..4], .little);
+    var second: [cd_sector]u8 = undefined;
+    try dev.readAt((@as(u64, rba) + 1) * cd_sector, &second);
+    if (!std.mem.eql(u8, second[2..10], plan.stage2_magic)) {
+        err("dklilo: the El Torito image is not a dklilo eltorito.bin\n", .{});
+        return 1;
+    }
+    const lba512: u64 = (@as(u64, rba) + 1) * 4;
+    const sectors512: u16 = @intCast((stage2_image.len + 511) / 512);
+    var bl: [10]u8 = undefined;
+    std.mem.writeInt(u64, bl[0..8], lba512, .little);
+    std.mem.writeInt(u16, bl[8..10], sectors512, .little);
+    try dev.writeAt(plan.blocklist_offset, &bl);
+    dev.file.sync(io_global) catch {};
+    out("stage 1 now loads stage 2 from 512-byte sector {d} ({d} sectors)\n", .{ lba512, sectors512 });
+    return 0;
+}
+
 // ---- main ------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !u8 {
@@ -461,9 +548,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "check")) return check(rest);
     if (std.mem.eql(u8, cmd, "install-bios")) return installBios(rest);
     if (std.mem.eql(u8, cmd, "install-uefi")) return installUefi(rest);
-    if (std.mem.eql(u8, cmd, "mkiso-images")) {
-        err("dklilo: mkiso-images is not implemented yet (milestone L7)\n", .{});
-        return 2;
-    }
+    if (std.mem.eql(u8, cmd, "mkiso-images")) return mkisoImages(rest);
+    if (std.mem.eql(u8, cmd, "isohybrid")) return isohybrid(rest);
     return usage();
 }
