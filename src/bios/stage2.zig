@@ -77,26 +77,23 @@ fn readE820() []const bp.E820Entry {
 
 const BootError = error{ NotFound, ReadFailed, BadKernel, NoMemory };
 
-fn open(set: *common.volumes.Set, default: *common.volumes.Volume, spec: []const u8) BootError!struct { fs: *common.ext4.Fs, ino: common.ext4.Inode } {
-    const at = set.resolve(spec, default) catch |e| {
+fn open(set: *common.volumes.Set, default: *common.volumes.Volume, spec: []const u8, subvol: ?[]const u8) BootError!common.volumes.Set.Opened {
+    return set.openFile(default, spec, subvol) catch |e| {
         say("\r\n{s}: {s}", .{ spec, @errorName(e) });
         return error.NotFound;
     };
-    const fs = at.vol.filesystem(set.allocator) orelse {
-        say("\r\n{s}: no filesystem", .{spec});
-        return error.NotFound;
-    };
-    const ino = fs.lookup(at.path) catch |e| {
-        say("\r\n{s}: {s}", .{ spec, @errorName(e) });
-        return error.NotFound;
-    };
-    return .{ .fs = fs, .ino = ino };
 }
 
-fn readInto(fs: *common.ext4.Fs, ino: *const common.ext4.Inode, offset: u64, dest: u64, len: u64) BootError!void {
+fn readInto(fs: *common.fs.Fs, file: *const common.fs.File, offset: u64, dest: u64, len: u64) BootError!void {
     const p: [*]u8 = @ptrFromInt(@as(usize, @intCast(dest)));
-    const n = fs.readAt(ino, offset, p[0..@intCast(len)]) catch return error.ReadFailed;
-    if (n != len) return error.ReadFailed;
+    const n = fs.readAt(file, offset, p[0..@intCast(len)]) catch |e| {
+        say("\r\nread error: {s}", .{@errorName(e)});
+        return error.ReadFailed;
+    };
+    if (n != len) {
+        say("\r\nshort read: {d} of {d}", .{ n, len });
+        return error.ReadFailed;
+    }
 }
 
 fn bootLinux(
@@ -104,13 +101,17 @@ fn bootLinux(
     default: *common.volumes.Volume,
     kernel_spec: []const u8,
     initrd_specs: []const []const u8,
+    subvol: ?[]const u8,
     cmdline: []const u8,
 ) BootError!void {
     say("\r\nLoading {s}...", .{kernel_spec});
-    var k = try open(set, default, kernel_spec);
+    var k = try open(set, default, kernel_spec, subvol);
     var head: [4096]u8 = undefined;
-    const head_len = k.fs.readAt(&k.ino, 0, &head) catch return error.ReadFailed;
-    const kernel = bp.parseKernel(head[0..head_len], k.ino.size) catch |e| {
+    const head_len = k.fs.readAt(&k.file, 0, &head) catch |e| {
+        say("\r\nread {s}: {s}", .{ kernel_spec, @errorName(e) });
+        return error.ReadFailed;
+    };
+    const kernel = bp.parseKernel(head[0..head_len], k.file.size) catch |e| {
         say("\r\nnot a bootable kernel: {s}", .{@errorName(e)});
         return error.BadKernel;
     };
@@ -122,8 +123,8 @@ fn bootLinux(
     var initrds: [8]@TypeOf(k) = undefined;
     if (initrd_specs.len > initrds.len) return error.NotFound;
     for (initrd_specs, 0..) |spec, i| {
-        initrds[i] = try open(set, default, spec);
-        total += std.mem.alignForward(u64, initrds[i].ino.size, 4);
+        initrds[i] = try open(set, default, spec, subvol);
+        total += std.mem.alignForward(u64, initrds[i].file.size, 4);
     }
     const kernel_end: u64 = kernel_addr + @max(@as(u64, kernel.pm_size), kernel.header.init_size);
     var initrd_at: u64 = 0;
@@ -134,15 +135,15 @@ fn bootLinux(
         };
     }
 
-    try readInto(k.fs, &k.ino, kernel.setup_size, kernel_addr, kernel.pm_size);
+    try readInto(k.fs, &k.file, kernel.setup_size, kernel_addr, kernel.pm_size);
     say("\r\nLoading initramfs...", .{});
     var off: u64 = 0;
     for (initrd_specs, 0..) |_, i| {
         var f = initrds[i];
-        try readInto(f.fs, &f.ino, 0, initrd_at + off, f.ino.size);
-        const padded = std.mem.alignForward(u64, f.ino.size, 4);
-        const pad: [*]u8 = @ptrFromInt(@as(usize, @intCast(initrd_at + off + f.ino.size)));
-        @memset(pad[0..@intCast(padded - f.ino.size)], 0);
+        try readInto(f.fs, &f.file, 0, initrd_at + off, f.file.size);
+        const padded = std.mem.alignForward(u64, f.file.size, 4);
+        const pad: [*]u8 = @ptrFromInt(@as(usize, @intCast(initrd_at + off + f.file.size)));
+        @memset(pad[0..@intCast(padded - f.file.size)], 0);
         off += padded;
     }
 
@@ -182,7 +183,7 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
         var pbuf: [256]u8 = undefined;
         var cbuf: [1024]u8 = undefined;
         const r = common.menu.manualPrompt(c, &pbuf, &cbuf) orelse return;
-        bootLinux(set, vol, r.path, &.{}, r.cmdline) catch {};
+        bootLinux(set, vol, r.path, &.{}, null, r.cmdline) catch {};
         say("\r\nBoot failed. Press a key.", .{});
         _ = c.getKey(null);
     }
@@ -217,7 +218,7 @@ export fn stage2_main() callconv(.c) noreturn {
                     const entry = cfg.entries[choice.index];
                     switch (entry.kind) {
                         .linux => {
-                            bootLinux(&set, f.vol, entry.target, entry.initrds, choice.cmdline) catch {};
+                            bootLinux(&set, f.vol, entry.target, entry.initrds, entry.subvol, choice.cmdline) catch {};
                             say("\r\nBoot failed. Press a key.", .{});
                             _ = c.getKey(null);
                         },

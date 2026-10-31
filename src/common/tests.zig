@@ -7,6 +7,9 @@ const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
 const ext4 = @import("fs/ext4.zig");
+const fs_mod = @import("fs/fs.zig");
+const btrfs = @import("fs/btrfs.zig");
+const test_options = @import("test_options");
 
 const manifest = @embedFile("manifest.txt");
 const gpa = std.testing.allocator;
@@ -15,26 +18,30 @@ fn disk(data: []const u8) blockdev.MemDisk {
     return .{ .data = data };
 }
 
-/// Opens an image as ext4 and checks every manifest file by hash and size.
-fn checkImage(image: []const u8) !void {
-    var d = disk(image);
-    var fs = try ext4.Fs.open(gpa, d.blockDev().whole());
+/// Checks every manifest file by hash and size through the generic `fs.Fs`.
+fn checkDisk(dev: blockdev.BlockDev) !void {
+    var fs = try fs_mod.Fs.open(gpa, dev.whole());
     defer fs.deinit();
+    try checkFs(&fs, null);
+}
 
+/// `prefix` is prepended to manifest paths (for subvolume images).
+fn checkFs(fs: *fs_mod.Fs, only_prefix: ?[]const u8) !void {
     var lines = std.mem.tokenizeScalar(u8, manifest, '\n');
     var count: usize = 0;
-    var buf = try gpa.alloc(u8, 6 * 1024 * 1024);
+    const buf = try gpa.alloc(u8, 6 * 1024 * 1024);
     defer gpa.free(buf);
     while (lines.next()) |line| {
         var f = std.mem.tokenizeSequence(u8, line, "  ");
         const want_hash = f.next().?;
         const want_size = try std.fmt.parseInt(u64, f.next().?, 10);
         const path = f.next().?;
+        if (only_prefix) |pre| if (!std.mem.startsWith(u8, path, pre)) continue;
 
-        const ino = try fs.lookup(path);
-        try std.testing.expect(ino.isRegular());
-        try std.testing.expectEqual(want_size, ino.size);
-        const n = try fs.readAt(&ino, 0, buf);
+        const file = try fs.lookup(path);
+        try std.testing.expect(file.is_regular);
+        try std.testing.expectEqual(want_size, file.size);
+        const n = try fs.readAt(&file, 0, buf);
         try std.testing.expectEqual(@as(usize, @intCast(want_size)), n);
 
         var h: [32]u8 = undefined;
@@ -46,7 +53,49 @@ fn checkImage(image: []const u8) !void {
         };
         count += 1;
     }
-    try std.testing.expect(count > 3000);
+    try std.testing.expect(count > 3000 or only_prefix != null);
+}
+
+fn checkImage(image: []const u8) !void {
+    var d = disk(image);
+    try checkDisk(d.blockDev());
+}
+
+/// A disk image read from a file, for images too big to embed (sparse btrfs).
+const FileDisk = struct {
+    file: std.Io.File,
+    sectors: u64,
+    /// Optional damage: reads covering these offsets get that byte flipped.
+    corrupt_at: ?u64 = null,
+    corrupt_also: ?u64 = null,
+
+    fn open(name: []const u8) !FileDisk {
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ test_options.fixtures_dir, name });
+        const f = std.Io.Dir.cwd().openFile(std.testing.io, path, .{}) catch return error.SkipZigTest;
+        return .{ .file = f, .sectors = (try f.length(std.testing.io)) / 512 };
+    }
+    fn close(self: *FileDisk) void {
+        self.file.close(std.testing.io);
+    }
+    fn blockDev(self: *FileDisk) blockdev.BlockDev {
+        return .{ .ctx = self, .readSectorsFn = read, .sector_size = 512, .sector_count = self.sectors };
+    }
+    fn read(ctx: *anyopaque, lba: u64, buf: []u8) blockdev.Error!void {
+        const self: *FileDisk = @ptrCast(@alignCast(ctx));
+        const off = lba * 512;
+        const n = self.file.readPositionalAll(std.testing.io, buf, off) catch return error.IoError;
+        if (n != buf.len) return error.IoError;
+        for ([_]?u64{ self.corrupt_at, self.corrupt_also }) |maybe| if (maybe) |c| {
+            if (c >= off and c < off + buf.len) buf[@intCast(c - off)] ^= 0xFF;
+        };
+    }
+};
+
+fn checkFileImage(name: []const u8) !void {
+    var d = try FileDisk.open(name);
+    defer d.close();
+    try checkDisk(d.blockDev());
 }
 
 test "ext4 4k blocks: every file matches" {
@@ -232,4 +281,144 @@ test "ext2: random metadata damage never crashes (no checksums)" {
 }
 test "ext4 inline: random metadata damage never crashes" {
     try mutationRun(@embedFile("ext4-inline.img"), 4, 300);
+}
+
+// ---- btrfs ---------------------------------------------------------------
+
+test "btrfs: every file matches (no compression)" {
+    try checkFileImage("btrfs.img");
+}
+test "btrfs: every file matches (zlib)" {
+    try checkFileImage("btrfs-zlib.img");
+}
+test "btrfs: every file matches (lzo)" {
+    try checkFileImage("btrfs-lzo.img");
+}
+test "btrfs: every file matches (zstd)" {
+    try checkFileImage("btrfs-zstd.img");
+}
+test "btrfs: DUP profile" {
+    try checkFileImage("btrfs-dup.img");
+}
+
+test "btrfs: compression is really in use" {
+    // The compressible file must be stored compressed, or the tests above
+    // would not exercise the decoders at all.
+    for ([_][]const u8{ "btrfs-zlib.img", "btrfs-lzo.img", "btrfs-zstd.img" }) |name| {
+        var d = try FileDisk.open(name);
+        defer d.close();
+        var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+        defer fs.deinit();
+        const ino = try fs.lookup("/boot/compressible.txt");
+        try std.testing.expectEqual(@as(u64, 1000000), ino.size);
+        const buf = try gpa.alloc(u8, 1000000);
+        defer gpa.free(buf);
+        try std.testing.expectEqual(@as(usize, 1000000), try fs.readAt(&ino, 0, buf));
+        try std.testing.expect(fs.debug_decompressed > 0);
+        try std.testing.expect(std.mem.startsWith(u8, buf, "the quick brown fox"));
+    }
+}
+
+test "btrfs: label, symlinks, dot-dot, holes, big directory" {
+    var d = try FileDisk.open("btrfs.img");
+    defer d.close();
+    var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    try std.testing.expectEqualStrings("dklbtrfs", fs.label());
+
+    try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("/boot/link-fast")).size);
+    try std.testing.expectEqual(@as(u64, 7), (try fs.lookup("/boot/link-dir")).size);
+    try std.testing.expectEqual(@as(u64, 7), (try fs.lookup("/boot/link-abs")).size);
+    _ = try fs.lookup("/boot/sub/../hello.txt");
+    try std.testing.expectError(error.NotFound, fs.lookup("/boot/nope"));
+    try std.testing.expectError(error.NotDirectory, fs.lookup("/boot/hello.txt/x"));
+
+    const sp = try fs.lookup("/boot/sparse");
+    var buf: [4096]u8 = undefined;
+    _ = try fs.readAt(&sp, 4096 * 100, &buf);
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
+
+    const many = try fs.lookup("/many");
+    var n: usize = 0;
+    try fs.walkDir(&many, &n, struct {
+        fn cb(cnt: *usize, e: btrfs.DirEntry) bool {
+            _ = e;
+            cnt.* += 1;
+            return false;
+        }
+    }.cb);
+    try std.testing.expectEqual(@as(usize, 3002), n);
+}
+
+test "btrfs: subvolumes (crossing, selecting, default)" {
+    {
+        var d = try FileDisk.open("btrfs-subvol.img");
+        defer d.close();
+        var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+        defer fs.deinit();
+        // /boot is its own subvolume; paths through it still resolve.
+        try checkFs(&fs, "/boot/");
+        // Selecting it makes it the root.
+        try fs.selectSubvolume("boot");
+        const f = try fs.lookup("/hello.txt");
+        try std.testing.expectEqual(@as(u64, 6), f.size);
+        try std.testing.expectError(error.NotFound, fs.selectSubvolume("nope"));
+    }
+    {
+        // `default:boot` makes the subvolume the default root.
+        var d = try FileDisk.open("btrfs-default.img");
+        defer d.close();
+        var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+        defer fs.deinit();
+        const f = try fs.lookup("/hello.txt");
+        try std.testing.expectEqual(@as(u64, 6), f.size);
+        // The top-level tree is still reachable by selecting it.
+        try fs.selectSubvolume("/");
+    }
+}
+
+test "btrfs: a damaged metadata copy falls back to the DUP mirror" {
+    var d = try FileDisk.open("btrfs-dup.img");
+    defer d.close();
+    var probe = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    var phys: [4]u64 = undefined;
+    const copies = try probe.mapLogical(probe.root_tree, probe.nodesize, &phys);
+    probe.deinit();
+    try std.testing.expect(copies >= 2);
+
+    // Corrupt the first copy of the root tree block.
+    d.corrupt_at = phys[0] + 200;
+    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    try checkFs(&fs, "/boot/sub/");
+
+    // Corrupt both copies: opening must fail, not return garbage.
+    d.corrupt_at = phys[0] + 200;
+    d.corrupt_also = phys[1] + 200;
+    try std.testing.expectError(error.ChecksumMismatch, btrfs.Fs.open(gpa, d.blockDev().whole()));
+}
+
+test "btrfs: random metadata damage never crashes" {
+    var d = try FileDisk.open("btrfs-zstd.img");
+    defer d.close();
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    for (0..40) |_| {
+        // Metadata lives in a few small regions of the sparse image; flip a
+        // byte in a block the filesystem reads often (the tree blocks).
+        d.corrupt_at = 0x10000 + rnd.uintLessThan(u64, 4096); // superblock
+        var fs = btrfs.Fs.open(gpa, d.blockDev().whole()) catch continue;
+        fs.deinit();
+    }
+    d.corrupt_at = null;
+    var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    const root = fs.root_tree;
+    var phys: [4]u64 = undefined;
+    _ = try fs.mapLogical(root, fs.nodesize, &phys);
+    for (0..60) |_| {
+        d.corrupt_at = phys[0] + rnd.uintLessThan(u64, fs.nodesize);
+        _ = fs.lookup("/boot/hello.txt") catch {};
+        _ = fs.lookup("/many") catch {};
+    }
 }

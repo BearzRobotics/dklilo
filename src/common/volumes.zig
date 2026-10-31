@@ -6,14 +6,14 @@
 const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
-const ext4 = @import("fs/ext4.zig");
+const fs_mod = @import("fs/fs.zig");
 
 pub const Error = error{
     /// A path prefix names a volume that isn't there.
     NoSuchVolume,
     /// The volume has no filesystem dklilo can read.
     NoFilesystem,
-} || ext4.Error;
+} || fs_mod.Error;
 
 pub const Volume = struct {
     region: blockdev.Region,
@@ -25,18 +25,18 @@ pub const Volume = struct {
     part_guid: ?[16]u8 = null,
     /// MBR disk signature, if from an MBR disk.
     mbr_signature: ?u32 = null,
-    state: enum { unprobed, ext4, none } = .unprobed,
-    fs: ext4.Fs = undefined,
+    state: enum { unprobed, open, none } = .unprobed,
+    fs: fs_mod.Fs = undefined,
 
-    /// The ext4 filesystem on this volume, or null if it has none we can read.
-    pub fn filesystem(self: *Volume, allocator: std.mem.Allocator) ?*ext4.Fs {
+    /// The filesystem on this volume, or null if it has none we can read.
+    pub fn filesystem(self: *Volume, allocator: std.mem.Allocator) ?*fs_mod.Fs {
         switch (self.state) {
-            .ext4 => return &self.fs,
+            .open => return &self.fs,
             .none => return null,
             .unprobed => {
-                if (ext4.Fs.open(allocator, self.region)) |fs| {
+                if (fs_mod.Fs.open(allocator, self.region)) |fs| {
                     self.fs = fs;
-                    self.state = .ext4;
+                    self.state = .open;
                     return &self.fs;
                 } else |_| {
                     self.state = .none;
@@ -57,7 +57,7 @@ pub const Set = struct {
     }
 
     pub fn deinit(self: *Set) void {
-        for (self.vols.items) |*v| if (v.state == .ext4) v.fs.deinit();
+        for (self.vols.items) |*v| if (v.state == .open) v.fs.deinit();
         self.vols.deinit(self.allocator);
     }
 
@@ -120,7 +120,7 @@ pub const Set = struct {
         const fs = v.filesystem(self.allocator) orelse return false;
         if (std.mem.eql(u8, prefix, "LABEL=")) return std.mem.eql(u8, fs.label(), value);
         var s: [36]u8 = undefined;
-        formatUuid(fs.uuid, &s);
+        formatUuid(fs.uuid(), &s);
         return std.ascii.eqlIgnoreCase(&s, value);
     }
 
@@ -133,20 +133,37 @@ pub const Set = struct {
             const fs = v.filesystem(self.allocator) orelse continue;
             for (paths) |p| {
                 const ino = fs.lookup(p) catch continue;
-                if (ino.isRegular()) return .{ .vol = v, .path = p };
+                if (ino.is_regular) return .{ .vol = v, .path = p };
             }
         }
         return null;
     }
 
+    pub const Opened = struct { fs: *fs_mod.Fs, file: fs_mod.File };
+
+    /// Resolves a config path (with optional `LABEL=`/`UUID=`/`PARTUUID=`
+    /// prefix) to an open file. `subvol` selects a btrfs subvolume first (null
+    /// for the default one); it is only meaningful for btrfs volumes.
+    pub fn openFile(self: *Set, default: *Volume, spec: []const u8, subvol: ?[]const u8) Error!Opened {
+        const at = try self.resolve(spec, default);
+        const fs = at.vol.filesystem(self.allocator) orelse return error.NoFilesystem;
+        try fs.selectSubvolume(subvol);
+        const file = try fs.lookup(at.path);
+        if (file.is_dir) return error.IsDirectory;
+        return .{ .fs = fs, .file = file };
+    }
+
     /// Reads a whole file into memory owned by the caller.
     pub fn readFile(self: *Set, vol: *Volume, path: []const u8) Error![]u8 {
-        const fs = vol.filesystem(self.allocator) orelse return error.NoFilesystem;
-        const ino = try fs.lookup(path);
-        if (ino.isDir()) return error.IsDirectory;
-        const buf = try self.allocator.alloc(u8, @intCast(ino.size));
+        return self.readSpec(vol, path, null);
+    }
+
+    /// Like `readFile`, for a config path with an optional subvolume.
+    pub fn readSpec(self: *Set, default: *Volume, spec: []const u8, subvol: ?[]const u8) Error![]u8 {
+        var o = try self.openFile(default, spec, subvol);
+        const buf = try self.allocator.alloc(u8, @intCast(o.file.size));
         errdefer self.allocator.free(buf);
-        const n = try fs.readAt(&ino, 0, buf);
+        const n = try o.fs.readAt(&o.file, 0, buf);
         if (n != buf.len) return error.Corrupt;
         return buf;
     }
@@ -181,7 +198,7 @@ test "a whole-disk filesystem is found by label, UUID, and config path" {
     try std.testing.expect(by_label.vol == def);
 
     var u: [36]u8 = undefined;
-    formatUuid(def.filesystem(std.testing.allocator).?.uuid, &u);
+    formatUuid(def.filesystem(std.testing.allocator).?.uuid(), &u);
     var spec_buf: [64]u8 = undefined;
     const spec = try std.fmt.bufPrint(&spec_buf, "UUID={s}:/x", .{u});
     try std.testing.expectEqualStrings("/x", (try set.resolve(spec, def)).path);

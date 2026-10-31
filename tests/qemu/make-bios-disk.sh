@@ -24,24 +24,37 @@ cp "$kernel" "$w/root/boot/vmlinuz"
 cp "$w/initrd1.img" "$w/root/boot/initrd1.img"
 cp "$w/initrd2.cpio" "$w/root/boot/initrd2.cpio"
 cp "$conf" "$w/root/boot/dklilo.conf"
-truncate -s 64M "$w/root.img"
-mkfs.ext4 -F -q -L dklroot -d "$w/root" "$w/root.img" >/dev/null 2>&1
+# ROOTFS=btrfs builds a zstd-compressed btrfs root with /boot as a subvolume
+# (needs mkfs.btrfs); the default is ext4.
+rootfs="${ROOTFS:-ext4}"
+if [ "$rootfs" = btrfs ]; then
+    mkbtrfs="${DKLILO_MKFS_BTRFS:-$(command -v mkfs.btrfs || echo "$HOME/.cache/dklilo/mkfs.btrfs")}"
+    [ -x "$mkbtrfs" ] || { echo "SKIP: no mkfs.btrfs"; exit 77; }
+    root_mb=160
+    truncate -s ${root_mb}M "$w/root.img"
+    "$mkbtrfs" -q -f -L dklroot --rootdir "$w/root" --compress zstd --subvol rw:boot "$w/root.img" >/dev/null 2>&1
+else
+    root_mb=64
+    truncate -s ${root_mb}M "$w/root.img"
+    mkfs.ext4 -F -q -L dklroot -d "$w/root" "$w/root.img" >/dev/null 2>&1
+fi
+root_sectors=$((root_mb * 2048))
 
 rm -f "$out"
-truncate -s 80M "$out"
+truncate -s $((root_mb + 16))M "$out"
 if [ "$kind" = gpt ]; then
     sgdisk -o "$out" >/dev/null
-    sgdisk -a 1 -n 1:64:2047 -t 1:EF02 -n 2:2048:133119 -t 2:8300 "$out" >/dev/null 2>&1
+    sgdisk -a 1 -n 1:64:2047 -t 1:EF02 -n 2:2048:$((2048 + root_sectors - 1)) -t 2:8300 "$out" >/dev/null 2>&1
     stage2_lba=64
 else
     sfdisk -q "$out" >/dev/null <<S
 label: dos
 label-id: 0x4a6f8c21
-start=2048, size=131072, type=83, bootable
+start=2048, size=$root_sectors, type=83, bootable
 S
     stage2_lba=1
 fi
-dd if="$w/root.img" of="$out" bs=512 seek=2048 conv=notrunc 2>/dev/null
+dd if="$w/root.img" of="$out" bs=512 seek=2048 conv=notrunc,sparse 2>/dev/null
 python3 - "$here/zig-out/stage1.bin" "$here/zig-out/stage2.bin" "$out" "$stage2_lba" <<'PY'
 import sys, struct
 s1 = open(sys.argv[1], 'rb').read()

@@ -31,14 +31,27 @@ truncate -s 33M "$w/esp.img"
 mkfs.fat -F 16 -n ESP "$w/esp.img" >/dev/null
 mmd -i "$w/esp.img" ::/EFI ::/EFI/BOOT
 mcopy -i "$w/esp.img" "$here/zig-out/bin/dkliloX64.efi" ::/EFI/BOOT/BOOTX64.EFI
-truncate -s 64M "$w/root.img"
-mkfs.ext4 -F -q -L dklroot -d "$w/root" "$w/root.img" >/dev/null 2>&1
+# ROOTFS=btrfs builds a zstd-compressed btrfs root with /boot as a subvolume
+# (needs mkfs.btrfs); the default is ext4.
+rootfs="${ROOTFS:-ext4}"
+if [ "$rootfs" = btrfs ]; then
+    mkbtrfs="${DKLILO_MKFS_BTRFS:-$(command -v mkfs.btrfs || echo "$HOME/.cache/dklilo/mkfs.btrfs")}"
+    [ -x "$mkbtrfs" ] || { echo "SKIP: no mkfs.btrfs"; exit 77; }
+    root_mb=160
+    truncate -s ${root_mb}M "$w/root.img"
+    "$mkbtrfs" -q -f -L dklroot --rootdir "$w/root" --compress zstd --subvol rw:boot "$w/root.img" >/dev/null 2>&1
+else
+    root_mb=64
+    truncate -s ${root_mb}M "$w/root.img"
+    mkfs.ext4 -F -q -L dklroot -d "$w/root" "$w/root.img" >/dev/null 2>&1
+fi
+root_sectors=$((root_mb * 2048))
 
-truncate -s 100M "$out"
+truncate -s $((root_mb + 40))M "$out"
 sfdisk -q "$out" >/dev/null <<S
 label: gpt
 start=2048, size=67584, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-start=69632, size=131072, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=4a6f8c21-0000-4000-8000-000000000002
+start=69632, size=$root_sectors, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=4a6f8c21-0000-4000-8000-000000000002
 S
 dd if="$w/esp.img" of="$out" bs=512 seek=2048 conv=notrunc 2>/dev/null
-dd if="$w/root.img" of="$out" bs=512 seek=69632 conv=notrunc 2>/dev/null
+dd if="$w/root.img" of="$out" bs=512 seek=69632 conv=notrunc,sparse 2>/dev/null

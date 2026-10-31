@@ -1,6 +1,6 @@
 # dklilo — Specification
 
-Status: **Draft v0.3** (L0-L3 implemented). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.4** (L0-L4 implemented). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -437,6 +437,12 @@ Details settled while building L0-L3 that the sections above leave open.
   `$DKLILO_KERNEL` (default `~/.cache/dklilo/vmlinuz`); it is never copied into
   the repository, which ignores kernel and initramfs files. Tests skip when no
   kernel is present. `tests/run-all.sh` runs everything.
+- **btrfs.** Tree blocks are always checksum-verified, with fallback to the
+  next mirror (DUP/RAID1); file *data* is not verified, because the checksum
+  tree is not consulted. A path may cross into a nested subvolume; `subvol =`
+  selects one by its path under the top level. zstd extents are padded to a
+  sector after the frame, so decoding stops at the first frame's end.
+  Fixtures need `mkfs.btrfs` (btrfs-progs 6.x); tests skip btrfs without it.
 - **32-bit build.** The shared code is compiled for both 32-bit x86 (BIOS) and
   64-bit targets, so `usize` is not `u64` in it; offsets are `u64` and
   converted explicitly.

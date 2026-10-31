@@ -28,6 +28,10 @@ ln -s sub/deeper/file "$t/boot/link-dir"
 ln -s "/boot/sub/deeper/file" "$t/boot/link-abs"
 slow=$(printf 's%.0s' $(seq 1 100))
 ln -s "$slow" "$t/boot/link-slow-dangling"
+# Highly compressible data (random bytes never compress, so the btrfs
+# compression paths need this), plus one small enough to be an inline extent.
+yes "the quick brown fox jumps over the lazy dog" | head -c 1000000 > "$t/boot/compressible.txt"
+yes "short compressible inline file" | head -c 1500 > "$t/boot/compressible-inline.txt"
 # A sparse file: data, a hole, then more data.
 dd if=/dev/urandom of="$t/boot/sparse" bs=4096 count=2 2>/dev/null
 dd if=/dev/urandom of="$t/boot/sparse" bs=4096 seek=300 count=2 conv=notrunc 2>/dev/null
@@ -55,6 +59,25 @@ mk ext2       mkfs.ext2 -F -q -b 1024
 mk ext3       mkfs.ext3 -F -q -b 4096
 # Inline data: only the small files fit, but the directories do too.
 mk ext4-inline mkfs.ext4 -F -q -b 4096 -O inline_data
+
+# --- btrfs images (need mkfs.btrfs; skipped when it is not installed) -------
+btrfs="${DKLILO_MKFS_BTRFS:-$(command -v mkfs.btrfs || echo "$HOME/.cache/dklilo/mkfs.btrfs")}"
+if [ -x "$btrfs" ]; then
+    mkb() { # name extra-args...  (128 MiB sparse images: the minimum for btrfs)
+        n="$1"; shift
+        truncate -s 128M "$out/$n.img"
+        "$btrfs" -q -f -L dklbtrfs --rootdir "$t" "$@" "$out/$n.img" >/dev/null 2>&1
+    }
+    mkb btrfs
+    mkb btrfs-zlib    --compress zlib
+    mkb btrfs-lzo     --compress lzo
+    mkb btrfs-zstd    --compress zstd
+    mkb btrfs-subvol  --subvol rw:boot
+    mkb btrfs-default --subvol default:boot
+    mkb btrfs-dup     -d dup -m dup
+else
+    echo "note: mkfs.btrfs not found, skipping btrfs images" >&2
+fi
 
 # --- partition tables -------------------------------------------------------
 truncate -s 64M "$out/mbr.img"

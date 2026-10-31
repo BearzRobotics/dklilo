@@ -203,12 +203,8 @@ var initrd_path = InitrdPath{};
 const BootError = error{ NotFound, ReadFailed, LoadFailed, StartFailed, OutOfMemory };
 
 /// Reads `spec` (a path, maybe with a LABEL=/UUID=/PARTUUID= prefix).
-fn readSpec(set: *common.volumes.Set, default: *common.volumes.Volume, spec: []const u8) BootError![]u8 {
-    const at = set.resolve(spec, default) catch |e| {
-        say("\r\n{s}: {s}", .{ spec, @errorName(e) });
-        return error.NotFound;
-    };
-    return set.readFile(at.vol, at.path) catch |e| {
+fn readSpec(set: *common.volumes.Set, default: *common.volumes.Volume, spec: []const u8, subvol: ?[]const u8) BootError![]u8 {
+    return set.readSpec(default, spec, subvol) catch |e| {
         say("\r\n{s}: {s}", .{ spec, @errorName(e) });
         return if (e == error.NotFound) error.NotFound else error.ReadFailed;
     };
@@ -219,12 +215,13 @@ fn bootLinux(
     default: *common.volumes.Volume,
     kernel_spec: []const u8,
     initrd_specs: []const []const u8,
+    subvol: ?[]const u8,
     cmdline: []const u8,
 ) BootError!void {
     const bs = uefi.system_table.boot_services.?;
 
     say("\r\nLoading {s}...", .{kernel_spec});
-    const kernel = try readSpec(set, default, kernel_spec);
+    const kernel = try readSpec(set, default, kernel_spec, subvol);
     defer allocator.free(kernel);
 
     // Concatenate the initramfs files, each padded to 4 bytes so the kernel's
@@ -236,7 +233,7 @@ fn bootLinux(
         parts.deinit(allocator);
     }
     for (initrd_specs) |spec| {
-        const data = try readSpec(set, default, spec);
+        const data = try readSpec(set, default, spec, subvol);
         try parts.append(allocator, data);
         total += std.mem.alignForward(usize, data.len, 4);
     }
@@ -329,7 +326,7 @@ pub fn main() void {
             const entry = cfg.entries[choice.index];
             switch (entry.kind) {
                 .linux => {
-                    bootLinux(&set, f.vol, entry.target, entry.initrds, choice.cmdline) catch {};
+                    bootLinux(&set, f.vol, entry.target, entry.initrds, entry.subvol, choice.cmdline) catch {};
                     say("\r\nBoot failed. Press a key.", .{});
                     _ = con.getKey(null);
                 },
@@ -359,7 +356,7 @@ fn manual(set: *common.volumes.Set, con: Console) void {
         var pbuf: [256]u8 = undefined;
         var cbuf: [1024]u8 = undefined;
         const r = common.menu.manualPrompt(con, &pbuf, &cbuf) orelse return;
-        bootLinux(set, vol, r.path, &.{}, r.cmdline) catch {};
+        bootLinux(set, vol, r.path, &.{}, null, r.cmdline) catch {};
         say("\r\nBoot failed. Press a key.", .{});
         _ = con.getKey(null);
     }

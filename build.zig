@@ -76,9 +76,16 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- tests: filesystem and partition readers against real images ----
+    // Images are written to a fixed directory in the build cache so the
+    // btrfs tests (128 MiB sparse files) can read them from disk instead of
+    // embedding them.
+    const fixtures_dir = ".zig-cache/dklilo-fixtures";
     const gen = b.addSystemCommand(&.{"sh"});
     gen.addFileArg(b.path("tests/images/make-fixtures.sh"));
-    const fixtures = gen.addOutputDirectoryArg("fixtures");
+    gen.addArg(fixtures_dir);
+
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "fixtures_dir", fixtures_dir);
 
     const common_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -87,11 +94,14 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
+    common_tests.root_module.addOptions("test_options", test_options);
+    common_tests.step.dependOn(&gen.step);
     for ([_][]const u8{
         "manifest.txt", "ext4.img",        "ext4-1k.img", "ext4-64bit.img", "ext3.img",
         "ext2.img",     "ext4-inline.img", "mbr.img",     "gpt.img",
     }) |name| {
-        common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = fixtures.path(b, name) });
+        const path = b.pathJoin(&.{ fixtures_dir, name });
+        common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(path) });
     }
     const test_step = b.step("test", "Run unit tests against real filesystem images");
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
