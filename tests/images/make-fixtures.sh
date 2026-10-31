@@ -7,6 +7,7 @@
 set -eu
 out="$1"
 mkdir -p "$out"
+out=$(cd "$out" && pwd)   # absolute: parts of this script cd elsewhere
 w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
 
 # --- the tree every filesystem image is populated from ----------------------
@@ -77,6 +78,28 @@ if [ -x "$btrfs" ]; then
     mkb btrfs-dup     -d dup -m dup
 else
     echo "note: mkfs.btrfs not found, skipping btrfs images" >&2
+fi
+
+# --- FAT12/16/32 with long names (mkfs.fat + mtools; FAT has no symlinks) ----
+if command -v mcopy >/dev/null 2>&1; then
+    cp -r "$t" "$w/fattree"
+    find "$w/fattree" -type l -delete
+    # mtools is quadratic in directory size: keep 1500 of the 3000 entries
+    # (still far more than one cluster of directory data, and it exercises
+    # long names spanning several directory sectors).
+    ( cd "$w/fattree/many" && ls | sed -n '1501,$p' | while read -r f; do rm -f "$f"; done )
+    ( cd "$w/fattree" && find . -type f | sort | while read -r f; do
+        p=${f#.}
+        printf '%s  %s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(wc -c < "$f")" "$p"
+      done ) > "$out/manifest-fat.txt"
+    mkf() { # name fat-bits size
+        truncate -s "$3" "$out/$1.img"
+        mkfs.fat -F "$2" -n DKLFAT "$out/$1.img" >/dev/null
+        ( cd "$w/fattree" && mcopy -s -n -i "$out/$1.img" ./* ::/ ) >/dev/null 2>&1
+    }
+    mkf fat12 12 16M
+    mkf fat16 16 32M
+    mkf fat32 32 64M
 fi
 
 # --- ISO 9660 with Rock Ridge (needs xorriso) ---------------------------------

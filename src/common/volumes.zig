@@ -146,9 +146,18 @@ pub const Set = struct {
         return std.ascii.eqlIgnoreCase(&s, value);
     }
 
-    /// Finds `dklilo.conf`: for each volume, `/boot/dklilo.conf` then
+    /// Finds `dklilo.conf`. The EFI System Partition's `\EFI\dklilo\dklilo.conf`
+    /// wins; otherwise each volume is tried for `/boot/dklilo.conf` then
     /// `/dklilo.conf`. `disk` limits the search to one disk (the boot disk).
     pub fn findConfig(self: *Set, disk: ?usize) ?struct { vol: *Volume, path: []const u8 } {
+        const esp_path = "/EFI/dklilo/dklilo.conf";
+        for (self.vols.items) |*v| {
+            if (disk) |d| if (v.disk != d) continue;
+            const fs = v.filesystem(self.allocator) orelse continue;
+            if (fs.* != .fat) continue;
+            const ino = fs.lookup(esp_path) catch continue;
+            if (ino.is_regular) return .{ .vol = v, .path = esp_path };
+        }
         const paths = [_][]const u8{ "/boot/dklilo.conf", "/dklilo.conf" };
         for (self.vols.items) |*v| {
             if (disk) |d| if (v.disk != d) continue;

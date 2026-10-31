@@ -1,6 +1,6 @@
 # dklilo — Specification
 
-Status: **Draft v0.5** (L0-L7 implemented). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.6** (L0-L7 implemented, FAT reader done). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -429,10 +429,15 @@ Details settled while building L0-L3 that the sections above leave open.
 - **Console.** BIOS mirrors screen and COM1 (115200 8N1) and reads both; on
   UEFI the firmware's console already includes serial. `serial =` is parsed
   but only BIOS COM1 at 115200 is used so far.
-- **Config search** checks `/boot/dklilo.conf` then `/dklilo.conf` on every
-  partition of the boot disk (then any disk, on UEFI). Reading
-  `\EFI\dklilo\dklilo.conf` from the ESP needs the FAT reader, which is
-  still to do (needed by L5 and L7 as well).
+- **Config search** tries `\EFI\dklilo\dklilo.conf` on every FAT volume
+  of the boot disk first, then `/boot/dklilo.conf` and `/dklilo.conf` on each
+  volume (then any disk, on UEFI). Plain paths in the config refer to the
+  volume the config came from, so a config on the ESP names its kernel with a
+  prefix such as `LABEL=root:/boot/vmlinuz`.
+- **FAT.** FAT12/16/32 with long names, case-insensitive lookup, run-merging
+  reads. FAT has no real UUID: `UUID=` does not match FAT volumes (use
+  `LABEL=`). The Windows chainload on UEFI still uses the firmware's own FAT
+  driver, because boot managers need a device path.
 - **Testing kernel.** QEMU boot tests use a stock distribution kernel read from
   `$DKLILO_KERNEL` (default `~/.cache/dklilo/vmlinuz`); it is never copied into
   the repository, which ignores kernel and initramfs files. Tests skip when no
@@ -461,6 +466,18 @@ Details settled while building L0-L3 that the sections above leave open.
   converted explicitly.
 - **LLVM quirk.** In `.code16` assembly `retf` encodes as the 32-bit `retfd`;
   far transfers are written as explicit bytes (see `realmode.zig`).
+
+### L10 — Loopback ISO boot (post-v1)
+- An `image`/`initrd` can name a file inside an ISO file stored on another
+  filesystem, for example `iso = /isos/rescue.iso` on an ext4 or btrfs
+  partition: the ISO file becomes a `Region` for the ISO 9660 reader, with
+  no copy into memory. A new entry key (`iso`) names the file; paths inside
+  the entry then refer to the ISO.
+- The kernel is told where the ISO lives (a `iso-scan/filename=...` style
+  parameter appended to the command line) so DKRescue's initramfs can find
+  and mount it as its root.
+- **Done when:** a DKRescue ISO placed on an ext4 partition boots through a
+  dklilo entry on both firmware types, and the same entry works from btrfs.
 
 ## 10. Decisions
 

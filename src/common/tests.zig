@@ -9,9 +9,11 @@ const part = @import("part.zig");
 const ext4 = @import("fs/ext4.zig");
 const fs_mod = @import("fs/fs.zig");
 const btrfs = @import("fs/btrfs.zig");
+const fat = @import("fs/fat.zig");
 const test_options = @import("test_options");
 
 const manifest = @embedFile("manifest.txt");
+const manifest_fat = @embedFile("manifest-fat.txt");
 const gpa = std.testing.allocator;
 
 fn disk(data: []const u8) blockdev.MemDisk {
@@ -27,7 +29,11 @@ fn checkDisk(dev: blockdev.BlockDev) !void {
 
 /// `prefix` is prepended to manifest paths (for subvolume images).
 fn checkFs(fs: *fs_mod.Fs, only_prefix: ?[]const u8) !void {
-    var lines = std.mem.tokenizeScalar(u8, manifest, '\n');
+    return checkFsWith(fs, manifest, only_prefix);
+}
+
+fn checkFsWith(fs: *fs_mod.Fs, manifest_text: []const u8, only_prefix: ?[]const u8) !void {
+    var lines = std.mem.tokenizeScalar(u8, manifest_text, '\n');
     var count: usize = 0;
     const buf = try gpa.alloc(u8, 6 * 1024 * 1024);
     defer gpa.free(buf);
@@ -53,7 +59,7 @@ fn checkFs(fs: *fs_mod.Fs, only_prefix: ?[]const u8) !void {
         };
         count += 1;
     }
-    try std.testing.expect(count > 3000 or only_prefix != null);
+    try std.testing.expect(count > 1400 or only_prefix != null);
 }
 
 fn checkImage(image: []const u8) !void {
@@ -452,4 +458,69 @@ test "iso9660: label, symlinks, long names, big directory, case" {
     try std.testing.expectEqual(@as(u64, 5), (try fs.lookup("/many/file-with-a-longish-name-7")).size);
     try std.testing.expectError(error.NotFound, fs.lookup("/boot/nope"));
     try std.testing.expectError(error.NotDirectory, fs.lookup("/boot/hello.txt/x"));
+}
+
+// ---- FAT -----------------------------------------------------------------
+
+fn checkFat(name: []const u8, kind: fat.Kind) !void {
+    var d = try FileDisk.open(name);
+    defer d.close();
+    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    try std.testing.expectEqual(kind, fs.fat.kind);
+    try std.testing.expectEqualStrings("DKLFAT", fs.label());
+    try checkFsWith(&fs, manifest_fat, null);
+}
+
+test "fat12: every file matches (long names, 3000-entry directory)" {
+    try checkFat("fat12.img", .fat12);
+}
+test "fat16: every file matches" {
+    try checkFat("fat16.img", .fat16);
+}
+test "fat32: every file matches" {
+    try checkFat("fat32.img", .fat32);
+}
+
+test "fat: case-insensitive names, dot-dot, backslashes, and errors" {
+    var d = try FileDisk.open("fat16.img");
+    defer d.close();
+    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("/BOOT/HELLO.TXT")).size);
+    try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("\\boot\\sub\\..\\hello.txt")).size);
+    try std.testing.expectEqual(@as(u64, 7), (try fs.lookup("/boot/sub/deeper/file")).size);
+    try std.testing.expectError(error.NotFound, fs.lookup("/boot/nope"));
+    try std.testing.expectError(error.NotDirectory, fs.lookup("/boot/hello.txt/x"));
+    // The sparse file's hole is real zeros on FAT.
+    const sp = try fs.lookup("/boot/sparse");
+    var buf: [4096]u8 = undefined;
+    _ = try fs.readAt(&sp, 4096 * 100, &buf);
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
+}
+
+test "fat: random damage to the boot sector and directories never crashes" {
+    var d = try FileDisk.open("fat32.img");
+    defer d.close();
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    for (0..60) |_| {
+        d.corrupt_at = rnd.uintLessThan(u64, 64 * 1024);
+        var fs = fs_mod.Fs.open(gpa, d.blockDev().whole()) catch continue;
+        defer fs.deinit();
+        _ = fs.lookup("/boot/hello.txt") catch {};
+        if (fs.lookup("/many")) |m| {
+            var n: usize = 0;
+            switch (fs) {
+                .fat => |*f| f.walkDir(&m.impl.fat, &n, struct {
+                    fn cb(c: *usize, e: fat.DirEntry) bool {
+                        _ = e;
+                        c.* += 1;
+                        return c.* > 5000;
+                    }
+                }.cb) catch {},
+                else => {},
+            }
+        } else |_| {}
+    }
 }

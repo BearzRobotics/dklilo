@@ -127,8 +127,8 @@ pub fn build(b: *std.Build) void {
     common_tests.root_module.addOptions("test_options", test_options);
     common_tests.step.dependOn(&gen.step);
     for ([_][]const u8{
-        "manifest.txt", "ext4.img",        "ext4-1k.img", "ext4-64bit.img", "ext3.img",
-        "ext2.img",     "ext4-inline.img", "mbr.img",     "gpt.img",
+        "manifest.txt", "manifest-fat.txt", "ext4.img", "ext4-1k.img", "ext4-64bit.img", "ext3.img",
+        "ext2.img",     "ext4-inline.img",  "mbr.img",  "gpt.img",
     }) |name| {
         const path = b.pathJoin(&.{ fixtures_dir, name });
         common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(path) });

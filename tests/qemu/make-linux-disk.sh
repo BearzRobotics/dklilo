@@ -23,7 +23,9 @@ mkdir -p "$w/root/boot"
 cp "$kernel" "$w/root/boot/vmlinuz"
 cp "$w/initrd1.img" "$w/root/boot/initrd1.img"
 cp "$w/initrd2.cpio" "$w/root/boot/initrd2.cpio"
-cp "$conf" "$w/root/boot/dklilo.conf"
+# CONFIG_IN_ESP=1 puts the configuration on the ESP (\EFI\dklilo\dklilo.conf)
+# instead of on the root filesystem.
+[ -n "${CONFIG_IN_ESP:-}" ] || cp "$conf" "$w/root/boot/dklilo.conf"
 
 # ESP (FAT16, 33 MiB) and root (ext4, 64 MiB) as separate images, then dd'd
 # into a GPT disk at the partition offsets.
@@ -32,6 +34,10 @@ mkfs.fat -F 16 -n ESP "$w/esp.img" >/dev/null
 mmd -i "$w/esp.img" ::/EFI ::/EFI/BOOT
 # NO_LOADER=1 leaves the ESP without the loader (the installer test adds it).
 [ -n "${NO_LOADER:-}" ] || mcopy -i "$w/esp.img" "$here/zig-out/bin/dkliloX64.efi" ::/EFI/BOOT/BOOTX64.EFI
+if [ -n "${CONFIG_IN_ESP:-}" ]; then
+    mmd -i "$w/esp.img" ::/EFI/dklilo
+    mcopy -i "$w/esp.img" "$conf" ::/EFI/dklilo/dklilo.conf
+fi
 if [ -n "${FAKE_WINDOWS:-}" ]; then   # a stand-in Windows Boot Manager
     mmd -i "$w/esp.img" ::/EFI/Microsoft ::/EFI/Microsoft/Boot
     mcopy -i "$w/esp.img" "$here/zig-out/bin/fake-bootmgfw.efi" ::/EFI/Microsoft/Boot/bootmgfw.efi
