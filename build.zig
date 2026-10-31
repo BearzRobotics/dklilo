@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     const stage2_bin = b.addObjCopy(stage2.getEmittedBin(), .{ .format = .binary });
     b.getInstallStep().dependOn(&b.addInstallFile(stage2_bin.getOutput(), "stage2.bin").step);
 
+    const common = b.createModule(.{ .root_source_file = b.path("src/common/root.zig") });
     const efi = b.addExecutable(.{
         .name = "dkliloX64",
         .root_module = b.createModule(.{
@@ -54,9 +55,24 @@ pub fn build(b: *std.Build) void {
                 .abi = .msvc,
             }),
             .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "common", .module = common }},
         }),
     });
     b.installArtifact(efi);
+
+    // Size limits from SPEC.md 5.1, enforced on every build.
+    for ([_]struct { name: []const u8, file: std.Build.LazyPath }{
+        .{ .name = "dkliloX64.efi", .file = efi.getEmittedBin() },
+        .{ .name = "stage2.bin", .file = stage2_bin.getOutput() },
+    }) |item| {
+        const check = b.addSystemCommand(&.{
+            "sh",                                                                                 "-c",
+            "[ \"$(stat -c%s \"$1\")\" -le 524288 ] || { echo \"$2 exceeds 512 KiB\"; exit 1; }", "sh",
+        });
+        check.addFileArg(item.file);
+        check.addArg(item.name);
+        b.getInstallStep().dependOn(&check.step);
+    }
 
     // ---- tests: filesystem and partition readers against real images ----
     const gen = b.addSystemCommand(&.{"sh"});

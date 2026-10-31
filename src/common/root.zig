@@ -5,6 +5,7 @@ pub const crc = @import("crc.zig");
 pub const config = @import("config.zig");
 pub const console = @import("console.zig");
 pub const menu = @import("menu.zig");
+pub const volumes = @import("volumes.zig");
 pub const part = @import("part.zig");
 pub const ext4 = @import("fs/ext4.zig");
 
@@ -14,6 +15,7 @@ test {
     _ = config;
     _ = console;
     _ = menu;
+    _ = volumes;
     _ = part;
     _ = ext4;
     _ = @import("tests.zig");
