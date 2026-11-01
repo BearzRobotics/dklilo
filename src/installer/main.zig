@@ -167,8 +167,14 @@ fn splitPartitionName(dev: []const u8, disk_buf: []u8) ?struct { disk: []const u
 }
 
 /// Finds the device mounted at (or containing) `dir` from /proc/self/mountinfo.
+/// /proc/self/mountinfo, or the file given as `config --mountinfo FILE` (tests).
+var mountinfo_override: ?[]const u8 = null;
+fn mountinfoPath() []const u8 {
+    return mountinfo_override orelse "/proc/self/mountinfo";
+}
+
 fn mountSource(dir: []const u8, buf: []u8) ?[]const u8 {
-    const text = Io.Dir.cwd().readFileAlloc(io_global, "/proc/self/mountinfo", gpa_global, .limited(1 << 20)) catch return null;
+    const text = Io.Dir.cwd().readFileAlloc(io_global, mountinfoPath(), gpa_global, .limited(1 << 20)) catch return null;
     defer gpa_global.free(text);
     var best_len: usize = 0;
     var found: ?[]const u8 = null;
@@ -198,7 +204,7 @@ fn mountSource(dir: []const u8, buf: []u8) ?[]const u8 {
 /// (from the `subvol=` mount option, without a leading slash), or null if it
 /// is not btrfs or is the top-level subvolume.
 fn mountSubvol(dir: []const u8, buf: []u8) ?[]const u8 {
-    const text = Io.Dir.cwd().readFileAlloc(io_global, "/proc/self/mountinfo", gpa_global, .limited(1 << 20)) catch return null;
+    const text = Io.Dir.cwd().readFileAlloc(io_global, mountinfoPath(), gpa_global, .limited(1 << 20)) catch return null;
     defer gpa_global.free(text);
     var best_len: usize = 0;
     var found: ?[]const u8 = null;
@@ -598,6 +604,9 @@ fn configCmd(args: []const [:0]const u8) !u8 {
             append = args[i];
         } else if (std.mem.eql(u8, a, "--force")) {
             force = true;
+        } else if (std.mem.eql(u8, a, "--mountinfo") and has_next) {
+            i += 1;
+            mountinfo_override = args[i];
         } else if (std.mem.eql(u8, a, "--no-windows")) {
             want_windows = false;
         } else return usage();
