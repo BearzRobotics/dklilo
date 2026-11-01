@@ -19,11 +19,22 @@ pub const Choice = struct {
     cmdline: []const u8,
 };
 
-/// Builds the default kernel command line for an entry: `root=` then `append`.
+/// Builds the default kernel command line for an entry: `root=`, then
+/// `append`, then (for a loopback ISO entry) `iso-scan/filename=` with the
+/// path of the ISO file, which distribution initramfs scripts understand.
 pub fn buildCmdline(entry: config.Entry, buf: []u8) []const u8 {
-    var n: usize = 0;
     if (entry.kind != .linux) return buf[0..0];
-    const parts = [_]?[]const u8{ if (entry.root != null) "root=" else null, entry.root, if (entry.root != null and entry.append != null) " " else null, entry.append };
+    var n: usize = 0;
+    const iso_path: ?[]const u8 = if (entry.iso) |i| config.specPath(i) else null;
+    const parts = [_]?[]const u8{
+        if (entry.root != null) "root=" else null,
+        entry.root,
+        if (entry.root != null and (entry.append != null or iso_path != null)) " " else null,
+        entry.append,
+        if (entry.append != null and iso_path != null) " " else null,
+        if (iso_path != null) "iso-scan/filename=" else null,
+        iso_path,
+    };
     for (parts) |maybe| if (maybe) |p| {
         const take = @min(p.len, buf.len - n);
         @memcpy(buf[n..][0..take], p[0..take]);
@@ -348,6 +359,13 @@ test "restricted entries ask for the password" {
     var f2 = FakeConsole{ .keys = &good };
     const c2 = run(f2.con(), &cfg, &buf).?;
     try testing.expectEqualStrings("root=/dev/x!", c2.cmdline);
+}
+
+test "a loopback ISO entry tells the kernel where the ISO is" {
+    var cfg = try config.parse(testing.allocator, "image = /boot/vmlinuz\n  append = \"quiet\"\n  iso = LABEL=data:/isos/rescue.iso\n", null);
+    defer cfg.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("quiet iso-scan/filename=/isos/rescue.iso", buildCmdline(cfg.entries[0], &buf));
 }
 
 test "no entries means the caller must prompt" {

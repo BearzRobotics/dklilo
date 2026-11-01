@@ -28,6 +28,8 @@ mkdir -p "$w/root/boot"
 cp "$kernel" "$w/root/boot/vmlinuz"
 cp "$w/initrd1.img" "$w/root/boot/initrd1.img"
 cp "$w/initrd2.cpio" "$w/root/boot/initrd2.cpio"
+# EXTRA_FILE=path adds that file as /isos/test.iso (the loopback ISO test).
+if [ -n "${EXTRA_FILE:-}" ]; then mkdir -p "$w/root/isos"; cp "$EXTRA_FILE" "$w/root/isos/test.iso"; fi
 cp "$conf" "$w/root/boot/dklilo.conf"
 # ROOTFS=btrfs builds a zstd-compressed btrfs root with /boot as a subvolume
 # (needs mkfs.btrfs); the default is ext4.

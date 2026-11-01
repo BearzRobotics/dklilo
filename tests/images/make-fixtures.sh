@@ -5,10 +5,14 @@
 # Needs no root: mke2fs -d populates an image from a directory.
 # Usage: make-fixtures.sh <output dir>
 set -eu
-out="$1"
-mkdir -p "$out"
-out=$(cd "$out" && pwd)   # absolute: parts of this script cd elsewhere
-w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
+final="$1"
+# Build in a scratch directory and swap it in at the end, so a reader (or a
+# second generator running at the same time) never sees a half-written or
+# mismatched set of images and manifest.
+mkdir -p "$(dirname "$final")"
+out="$(cd "$(dirname "$final")" && pwd)/.$(basename "$final").$$"
+rm -rf "$out"; mkdir -p "$out"
+w=$(mktemp -d); trap 'rm -rf "$w" "$out"' EXIT
 
 # --- the tree every filesystem image is populated from ----------------------
 t="$w/tree"
@@ -39,6 +43,13 @@ dd if=/dev/urandom of="$t/boot/sparse" bs=4096 seek=300 count=2 conv=notrunc 2>/
 # A directory big enough to get an htree on ext4.
 i=0; while [ $i -lt 3000 ]; do : > "$t/many/file-with-a-longish-name-$i"; i=$((i+1)); done
 printf 'tiny\n' > "$t/many/file-with-a-longish-name-7"
+
+# A small ISO stored as a file, for the loopback-mount tests.
+if command -v xorriso >/dev/null 2>&1; then
+    mkdir -p "$w/mini" "$t/isos"
+    printf 'nested iso\n' > "$w/mini/hello.txt"
+    xorriso -as mkisofs -quiet -no-pad -R -V NESTED -o "$t/isos/nested.iso" "$w/mini" >/dev/null 2>&1
+fi
 
 ( cd "$t" && find . -type f | sort | while read -r f; do
     p=${f#.}
@@ -126,3 +137,9 @@ label-id: 6a1e7c3e-9a01-4f6c-8b5d-0c2c0fd0a001
 start=2048, size=8192, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=11111111-2222-3333-4444-555555555555, name="root"
 start=10240, size=8192, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, name="esp"
 S
+
+# --- publish ---------------------------------------------------------------
+rm -rf "$final.old"
+[ ! -e "$final" ] || mv "$final" "$final.old"
+mv "$out" "$final"
+rm -rf "$final.old"

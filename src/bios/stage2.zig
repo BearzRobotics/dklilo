@@ -98,12 +98,23 @@ fn readInto(fs: *common.fs.Fs, file: *const common.fs.File, offset: u64, dest: u
 
 fn bootLinux(
     set: *common.volumes.Set,
-    default: *common.volumes.Volume,
+    default_in: *common.volumes.Volume,
     kernel_spec: []const u8,
     initrd_specs: []const []const u8,
-    subvol: ?[]const u8,
+    subvol_in: ?[]const u8,
+    iso: ?[]const u8,
     cmdline: []const u8,
 ) BootError!void {
+    // A loopback ISO entry reads the kernel and initramfs from inside the ISO.
+    var default = default_in;
+    var subvol = subvol_in;
+    if (iso) |spec| {
+        default = set.isoVolume(default_in, spec, subvol_in) catch |e| {
+            say("\r\n{s}: {s}", .{ spec, @errorName(e) });
+            return error.NotFound;
+        };
+        subvol = null;
+    }
     say("\r\nLoading {s}...", .{kernel_spec});
     var k = try open(set, default, kernel_spec, subvol);
     var head: [4096]u8 = undefined;
@@ -224,7 +235,7 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
         var pbuf: [256]u8 = undefined;
         var cbuf: [1024]u8 = undefined;
         const r = common.menu.manualPrompt(c, &pbuf, &cbuf) orelse return;
-        bootLinux(set, vol, r.path, &.{}, null, r.cmdline) catch {};
+        bootLinux(set, vol, r.path, &.{}, null, null, r.cmdline) catch {};
         say("\r\nBoot failed. Press a key.", .{});
         _ = c.getKey(null);
     }
@@ -259,7 +270,7 @@ export fn stage2_main() callconv(.c) noreturn {
                     const entry = cfg.entries[choice.index];
                     switch (entry.kind) {
                         .linux => {
-                            bootLinux(&set, f.vol, entry.target, entry.initrds, entry.subvol, choice.cmdline) catch {};
+                            bootLinux(&set, f.vol, entry.target, entry.initrds, entry.subvol, entry.iso, choice.cmdline) catch {};
                             say("\r\nBoot failed. Press a key.", .{});
                             _ = c.getKey(null);
                         },

@@ -427,8 +427,20 @@ fn check(args: []const [:0]const u8) !u8 {
             out("ok:   {s}: chainload {s}\n", .{ e.label, e.target });
             continue;
         }
-        problems += checkFile(&set, default_vol, e.label, "image", e.target, e.subvol);
-        for (e.initrds) |ir| problems += checkFile(&set, default_vol, e.label, "initrd", ir, e.subvol);
+        var vol = default_vol;
+        var sub = e.subvol;
+        if (e.iso) |iso| {
+            // Loopback ISO: mount the file, then check inside it.
+            vol = set.isoVolume(default_vol, iso, e.subvol) catch |er| {
+                err("FAIL: {s}: iso {s}: {s}\n", .{ e.label, iso, @errorName(er) });
+                problems += 1;
+                continue;
+            };
+            sub = null;
+            out("ok:   {s}: iso {s}\n", .{ e.label, iso });
+        }
+        problems += checkFile(&set, vol, e.label, "image", e.target, sub);
+        for (e.initrds) |ir| problems += checkFile(&set, vol, e.label, "initrd", ir, sub);
         if (e.root) |r| {
             if ((std.mem.startsWith(u8, r, "LABEL=") or std.mem.startsWith(u8, r, "UUID=")) and e.initrds.len == 0) {
                 out("warn: {s}: root={s} needs an initramfs to be resolved (PARTUUID= works without)\n", .{ e.label, r });

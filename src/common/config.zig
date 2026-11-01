@@ -41,6 +41,9 @@ pub const Entry = struct {
     append: ?[]const u8 = null,
     initrds: []const []const u8 = &.{},
     subvol: ?[]const u8 = null,
+    /// `iso =`: an ISO file (on the entry's volume) that `image` and `initrd`
+    /// are read from. The kernel is told where the file is.
+    iso: ?[]const u8 = null,
     restricted: bool = false,
     /// Line of the `image`/`other` that started the entry, for diagnostics.
     line: usize = 0,
@@ -193,6 +196,9 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
         } else if (std.mem.eql(u8, key, "subvol")) {
             if (e.kind != .linux) return error.MisplacedKey;
             e.subvol = value;
+        } else if (std.mem.eql(u8, key, "iso")) {
+            if (e.kind != .linux or value.len == 0) return error.MisplacedKey;
+            e.iso = value;
         } else if (isGlobalKey(key)) {
             return error.MisplacedKey;
         } else return error.UnknownKey;
@@ -226,7 +232,7 @@ fn finishEntry(
 }
 
 fn isEntryKey(k: []const u8) bool {
-    inline for (.{ "label", "root", "append", "initrd", "subvol", "restricted" }) |n| {
+    inline for (.{ "label", "root", "append", "initrd", "subvol", "iso", "restricted" }) |n| {
         if (std.mem.eql(u8, k, n)) return true;
     }
     return false;
@@ -239,7 +245,27 @@ fn isGlobalKey(k: []const u8) bool {
     return false;
 }
 
+/// The path part of a config path spec: `LABEL=x:/boot/k` -> `/boot/k`;
+/// a plain path is returned unchanged.
+pub fn specPath(spec: []const u8) []const u8 {
+    inline for (.{ "LABEL=", "UUID=", "PARTUUID=" }) |pre| {
+        if (std.mem.startsWith(u8, spec, pre)) {
+            if (std.mem.indexOfScalar(u8, spec, ':')) |c| return spec[c + 1 ..];
+        }
+    }
+    return spec;
+}
+
 const testing = std.testing;
+
+test "iso key and specPath" {
+    var c = try parse(testing.allocator, "image = /boot/vmlinuz\n  iso = LABEL=data:/isos/r.iso\n", null);
+    defer c.deinit();
+    try testing.expectEqualStrings("LABEL=data:/isos/r.iso", c.entries[0].iso.?);
+    try testing.expectEqualStrings("/isos/r.iso", specPath(c.entries[0].iso.?));
+    try testing.expectEqualStrings("/plain", specPath("/plain"));
+    try testing.expectError(error.MisplacedKey, parse(testing.allocator, "other = windows\n  iso = /x.iso\n", null));
+}
 
 test "the example from the spec parses" {
     const text =

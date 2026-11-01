@@ -450,6 +450,8 @@ pub const Fs = struct {
                 depth_checked = true;
                 if (hdr.depth > 5) return error.Corrupt;
             } else if (hdr.depth != expect_depth) return error.Corrupt;
+            // Each level below the root is exactly one shallower.
+            expect_depth = hdr.depth -| 1;
             if (12 + @as(usize, hdr.entries) * 12 > node_slice.len) return error.Corrupt;
 
             if (hdr.depth == 0) {

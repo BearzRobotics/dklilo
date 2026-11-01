@@ -59,16 +59,56 @@ pub const Volume = struct {
     }
 };
 
+/// A file inside a filesystem presented as a block device, so a filesystem
+/// image stored as a file (a loopback ISO) can be read in place.
+const FileDev = struct {
+    fs: *fs_mod.Fs,
+    file: fs_mod.File,
+
+    const sector = 2048;
+
+    fn blockDev(self: *FileDev) blockdev.BlockDev {
+        return .{
+            .ctx = self,
+            .readSectorsFn = read,
+            .sector_size = sector,
+            .sector_count = self.file.size / sector,
+        };
+    }
+
+    fn read(ctx: *anyopaque, lba: u64, buf: []u8) blockdev.Error!void {
+        const self: *FileDev = @ptrCast(@alignCast(ctx));
+        const n = self.fs.readAt(&self.file, lba * sector, buf) catch return error.IoError;
+        if (n != buf.len) return error.IoError;
+    }
+};
+
+/// A mounted loopback image: the file, and a volume over it.
+const Mount = struct {
+    spec: []u8,
+    subvol: ?[]u8,
+    dev: FileDev,
+    vol: Volume,
+};
+
 pub const Set = struct {
     allocator: std.mem.Allocator,
     vols: std.ArrayList(Volume) = .empty,
     disks: usize = 0,
+    mounts: std.ArrayList(*Mount) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Set {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Set) void {
+        for (self.mounts.items) |m| {
+            if (m.vol.state == .open) m.vol.fs.deinit();
+            self.allocator.free(m.spec);
+            if (m.subvol) |sv| self.allocator.free(sv);
+            self.allocator.destroy(m);
+        }
+        self.mounts.deinit(self.allocator);
         for (self.vols.items) |*v| if (v.state == .open) v.fs.deinit();
         self.vols.deinit(self.allocator);
     }
@@ -189,6 +229,30 @@ pub const Set = struct {
         return null;
     }
 
+    /// Mounts the ISO file named by `spec` (a path on `default`, or with a
+    /// volume prefix) and returns a volume to read the kernel and initramfs
+    /// from. Mounting the same file twice returns the same volume.
+    pub fn isoVolume(self: *Set, default: *Volume, spec: []const u8, subvol: ?[]const u8) Error!*Volume {
+        for (self.mounts.items) |m| {
+            const same_sub = if (m.subvol) |a| (subvol != null and std.mem.eql(u8, a, subvol.?)) else subvol == null;
+            if (same_sub and std.mem.eql(u8, m.spec, spec)) return &m.vol;
+        }
+        const o = try self.openFile(default, spec, subvol);
+        const m = try self.allocator.create(Mount);
+        errdefer self.allocator.destroy(m);
+        m.spec = try self.allocator.dupe(u8, spec);
+        errdefer self.allocator.free(m.spec);
+        m.subvol = if (subvol) |sv| try self.allocator.dupe(u8, sv) else null;
+        m.dev = .{ .fs = o.fs, .file = o.file };
+        m.vol = .{ .region = m.dev.blockDev().whole(), .disk = std.math.maxInt(usize), .number = 0 };
+        if (!iso9660.isIso(m.vol.region)) {
+            if (m.subvol) |sv| self.allocator.free(sv);
+            return error.NoFilesystem;
+        }
+        try self.mounts.append(self.allocator, m);
+        return &m.vol;
+    }
+
     pub const Opened = struct { fs: *fs_mod.Fs, file: fs_mod.File };
 
     /// Resolves a config path (with optional `LABEL=`/`UUID=`/`PARTUUID=`
@@ -294,4 +358,22 @@ test "Windows boot partition: the active NTFS boot sector wins" {
     // Make partition 3 active: it should win now.
     set.vols.items[2].bootable = true;
     try std.testing.expectEqual(@as(u8, 3), set.findWindowsBoot(disk).?.number);
+}
+
+test "an ISO file inside an ext4 image is mounted in place" {
+    var d = blockdev.MemDisk{ .data = @embedFile("ext4.img") };
+    var set = Set.init(std.testing.allocator);
+    defer set.deinit();
+    _ = try set.addDisk(d.blockDev());
+    const host = &set.vols.items[0];
+
+    const iso = try set.isoVolume(host, "/isos/nested.iso", null);
+    const data = try set.readSpec(iso, "/hello.txt", null);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("nested iso\n", data);
+    // Mounting the same file again reuses the mount.
+    try std.testing.expect(iso == try set.isoVolume(host, "/isos/nested.iso", null));
+    // A file that is not an ISO is refused.
+    try std.testing.expectError(error.NoFilesystem, set.isoVolume(host, "/boot/hello.txt", null));
+    try std.testing.expectError(error.NotFound, set.isoVolume(host, "/isos/missing.iso", null));
 }

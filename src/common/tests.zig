@@ -67,6 +67,19 @@ fn checkImage(image: []const u8) !void {
     try checkDisk(d.blockDev());
 }
 
+/// Up to 16 byte overwrites, applied to data as it is read.
+const Patches = struct {
+    off: [16]u64 = undefined,
+    val: [16]u8 = undefined,
+    n: usize = 0,
+
+    fn apply(self: *const Patches, base: u64, buf: []u8) void {
+        for (0..self.n) |i| {
+            if (self.off[i] >= base and self.off[i] < base + buf.len) buf[@intCast(self.off[i] - base)] = self.val[i];
+        }
+    }
+};
+
 /// A disk image read from a file, for images too big to embed (sparse btrfs).
 const FileDisk = struct {
     file: std.Io.File,
@@ -74,6 +87,8 @@ const FileDisk = struct {
     /// Optional damage: reads covering these offsets get that byte flipped.
     corrupt_at: ?u64 = null,
     corrupt_also: ?u64 = null,
+    /// Byte overwrites applied to every read (used by the fuzz tests).
+    patches: Patches = .{},
 
     fn open(name: []const u8) !FileDisk {
         var path_buf: [512]u8 = undefined;
@@ -92,6 +107,7 @@ const FileDisk = struct {
         const off = lba * 512;
         const n = self.file.readPositionalAll(std.testing.io, buf, off) catch return error.IoError;
         if (n != buf.len) return error.IoError;
+        self.patches.apply(off, buf);
         for ([_]?u64{ self.corrupt_at, self.corrupt_also }) |maybe| if (maybe) |c| {
             if (c >= off and c < off + buf.len) buf[@intCast(c - off)] ^= 0xFF;
         };
@@ -523,4 +539,155 @@ test "fat: random damage to the boot sector and directories never crashes" {
             }
         } else |_| {}
     }
+}
+
+// ---- fuzzing -----------------------------------------------------------------
+//
+// Run with `zig build test --fuzz=100K` for a real session. In an ordinary
+// `zig build test` each target runs once, as a smoke test. The properties:
+// whatever bytes are on the disk (or in the input), the readers return an
+// error or valid data. They never crash, hang, read out of bounds or leak.
+
+const fuzz_config = @import("config.zig");
+const lzo = @import("compress/lzo.zig");
+
+fn fuzzConfig(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [1024]u8 = undefined;
+    const n = smith.slice(&buf);
+    var cfg = fuzz_config.parse(std.testing.allocator, buf[0..n], null) catch return;
+    cfg.deinit();
+}
+
+test "fuzz: config parser" {
+    try std.testing.fuzz({}, fuzzConfig, .{ .corpus = &.{
+        "timeout = 50\nimage = /boot/vmlinuz\n  label = a\n  append = \"ro quiet\"\n",
+        "other = windows\n  label = w\n",
+    } });
+}
+
+fn fuzzLzo(_: void, smith: *std.testing.Smith) anyerror!void {
+    var in: [512]u8 = undefined;
+    const n = smith.slice(&in);
+    var out: [8192]u8 = undefined;
+    _ = lzo.decompress(in[0..n], &out) catch return;
+}
+
+test "fuzz: lzo decoder" {
+    try std.testing.fuzz({}, fuzzLzo, .{});
+}
+
+const FuzzTarget = struct {
+    disk: FileDisk,
+    name: []const u8,
+};
+
+/// Fills `d.patches` from the fuzzer: a few byte overwrites, mostly in the
+/// first megabytes where metadata lives.
+fn fuzzPatches(d: *FileDisk, smith: *std.testing.Smith) void {
+    d.patches.n = smith.valueRangeAtMost(u8, 0, 16);
+    for (0..d.patches.n) |i| {
+        d.patches.off[i] = smith.valueRangeLessThan(u32, 0, 4 * 1024 * 1024);
+        d.patches.val[i] = smith.value(u8);
+    }
+}
+
+fn exerciseFs(fs: *fs_mod.Fs) void {
+    const paths = [_][]const u8{ "/boot/hello.txt", "/boot/big.bin", "/boot/link-dir", "/many/file-with-a-longish-name-7", "/boot/sparse" };
+    var buf: [16 * 1024]u8 = undefined;
+    for (paths) |p| {
+        const f = fs.lookup(p) catch continue;
+        _ = fs.readAt(&f, 0, &buf) catch {};
+        _ = fs.readAt(&f, f.size / 2, &buf) catch {};
+    }
+    const dir = fs.lookup("/many") catch return;
+    var count: usize = 0;
+    const Counter = struct {
+        fn stop(c: *usize) bool {
+            c.* += 1;
+            return c.* > 3000;
+        }
+    };
+    switch (fs.*) {
+        .ext4 => |*f| f.walkDir(&dir.impl.ext4, &count, struct {
+            fn cb(c: *usize, e: ext4.DirEntry) bool {
+                _ = e;
+                return Counter.stop(c);
+            }
+        }.cb) catch {},
+        .btrfs => |*f| f.walkDir(&dir.impl.btrfs, &count, struct {
+            fn cb(c: *usize, e: btrfs.DirEntry) bool {
+                _ = e;
+                return Counter.stop(c);
+            }
+        }.cb) catch {},
+        .fat => |*f| f.walkDir(&dir.impl.fat, &count, struct {
+            fn cb(c: *usize, e: fat.DirEntry) bool {
+                _ = e;
+                return Counter.stop(c);
+            }
+        }.cb) catch {},
+        .iso9660 => |*f| f.walkDir(&dir.impl.iso9660, &count, struct {
+            fn cb(c: *usize, e: @import("fs/iso9660.zig").Fs.DirEntry) bool {
+                _ = e;
+                return Counter.stop(c);
+            }
+        }.cb) catch {},
+    }
+}
+
+fn fuzzFs(target: *FileDisk, smith: *std.testing.Smith) anyerror!void {
+    fuzzPatches(target, smith);
+    var fs = fs_mod.Fs.open(gpa, target.blockDev().whole()) catch return;
+    defer fs.deinit();
+    exerciseFs(&fs);
+}
+
+fn fuzzFsImage(comptime name: []const u8) !void {
+    var d = try FileDisk.open(name);
+    defer d.close();
+    try std.testing.fuzz(&d, fuzzFs, .{});
+}
+
+test "fuzz: ext4" {
+    try fuzzFsImage("ext4.img");
+}
+test "fuzz: ext2 (block maps)" {
+    try fuzzFsImage("ext2.img");
+}
+test "fuzz: ext4 inline data" {
+    try fuzzFsImage("ext4-inline.img");
+}
+test "fuzz: btrfs (zstd)" {
+    try fuzzFsImage("btrfs-zstd.img");
+}
+test "fuzz: btrfs (lzo)" {
+    try fuzzFsImage("btrfs-lzo.img");
+}
+test "fuzz: fat16" {
+    try fuzzFsImage("fat16.img");
+}
+test "fuzz: fat32" {
+    try fuzzFsImage("fat32.img");
+}
+test "fuzz: iso9660" {
+    try fuzzFsImage("iso.img");
+}
+
+fn fuzzPartitions(target: *FileDisk, smith: *std.testing.Smith) anyerror!void {
+    fuzzPatches(target, smith);
+    // Partition tables live in the first sectors: concentrate there.
+    for (0..target.patches.n) |i| target.patches.off[i] %= 64 * 1024;
+    const t = part.read(target.blockDev()) catch return;
+    for (t.slice()) |p| _ = p.region(target.blockDev());
+}
+
+test "fuzz: MBR partition table" {
+    var d = try FileDisk.open("mbr.img");
+    defer d.close();
+    try std.testing.fuzz(&d, fuzzPartitions, .{});
+}
+test "fuzz: GPT partition table" {
+    var d = try FileDisk.open("gpt.img");
+    defer d.close();
+    try std.testing.fuzz(&d, fuzzPartitions, .{});
 }
