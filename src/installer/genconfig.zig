@@ -24,6 +24,8 @@ pub const Options = struct {
     timeout: u32 = 50,
     windows: bool = false,
     serial: ?[]const u8 = null,
+    /// btrfs subvolume holding the kernels, if not the default one.
+    subvol: ?[]const u8 = null,
 };
 
 fn isKernelName(name: []const u8) bool {
@@ -119,6 +121,7 @@ pub fn render(w: *std.Io.Writer, kernels: []const Kernel, opt: Options) !void {
         try w.print("\nimage  = {s}/{s}\n    label  = ", .{ opt.prefix, k.image });
         try labelFor(w, idx, k);
         try w.writeByte('\n');
+        if (opt.subvol) |sv| try w.print("    subvol = {s}\n", .{sv});
         if (opt.root) |r| try w.print("    root   = {s}\n", .{r});
         if (opt.append.len > 0) try w.print("    append = \"{s}\"\n", .{opt.append});
         if (k.initrd) |ir| try w.print("    initrd = {s}/{s}\n", .{ opt.prefix, ir });
@@ -147,6 +150,20 @@ test "an unversioned vmlinuz takes initrd.img but not a versioned one" {
     defer testing.allocator.free(ks);
     try testing.expectEqual(@as(usize, 1), ks.len);
     try testing.expectEqualStrings("initrd.img", ks[0].initrd.?);
+}
+
+test "btrfs subvolume is written to every entry and parses" {
+    const config = @import("common").config;
+    const names = [_][]const u8{ "vmlinuz-1", "vmlinuz-2" };
+    const ks = try findKernels(testing.allocator, &names);
+    defer testing.allocator.free(ks);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try render(&aw.writer, ks, .{ .subvol = "@boot", .append = "ro rootflags=subvol=@" });
+    var diag = config.Diagnostic{};
+    var c = try config.parse(testing.allocator, aw.written(), &diag);
+    defer c.deinit();
+    try testing.expectEqualStrings("@boot", c.entries[1].subvol.?);
 }
 
 test "rendered config parses and has the right entries" {

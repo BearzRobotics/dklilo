@@ -194,6 +194,44 @@ fn mountSource(dir: []const u8, buf: []u8) ?[]const u8 {
     return found;
 }
 
+/// For the mount holding `dir`: the btrfs subvolume it was mounted from
+/// (from the `subvol=` mount option, without a leading slash), or null if it
+/// is not btrfs or is the top-level subvolume.
+fn mountSubvol(dir: []const u8, buf: []u8) ?[]const u8 {
+    const text = Io.Dir.cwd().readFileAlloc(io_global, "/proc/self/mountinfo", gpa_global, .limited(1 << 20)) catch return null;
+    defer gpa_global.free(text);
+    var best_len: usize = 0;
+    var found: ?[]const u8 = null;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        var i: usize = 0;
+        var mp: []const u8 = "";
+        while (f.next()) |tok| : (i += 1) {
+            if (i == 4) mp = tok;
+            if (!std.mem.eql(u8, tok, "-")) continue;
+            const fstype = f.next() orelse break;
+            _ = f.next(); // source
+            const opts = f.next() orelse "";
+            if (!std.mem.startsWith(u8, dir, mp) or mp.len < best_len) break;
+            best_len = mp.len;
+            found = null;
+            if (!std.mem.eql(u8, fstype, "btrfs")) break;
+            var o = std.mem.tokenizeScalar(u8, opts, ',');
+            while (o.next()) |opt| {
+                if (!std.mem.startsWith(u8, opt, "subvol=")) continue;
+                const v = std.mem.trim(u8, opt["subvol=".len..], "/");
+                if (v.len > 0 and v.len <= buf.len) {
+                    @memcpy(buf[0..v.len], v);
+                    found = buf[0..v.len];
+                }
+            }
+            break;
+        }
+    }
+    return found;
+}
+
 fn installUefi(args: []const [:0]const u8) !u8 {
     var esp: ?[]const u8 = null;
     var removable = false;
@@ -612,10 +650,30 @@ fn configCmd(args: []const [:0]const u8) !u8 {
     }
     if (root_val == null) err("dklilo: warning: could not work out the root device; pass --root\n", .{});
 
+    // btrfs: kernels may live in a subvolume, and the kernel must be told which
+    // subvolume is the root.
+    var sv_buf1: [256]u8 = undefined;
+    var sv_buf2: [256]u8 = undefined;
+    var rf_buf: [320]u8 = undefined;
+    var app_buf: [512]u8 = undefined;
+    const boot_sub = mountSubvol(abs, &sv_buf1);
+    const root_sub = mountSubvol("/", &sv_buf2);
+    if (root_sub) |rs| {
+        if (std.mem.indexOf(u8, append, "rootflags=") == null) {
+            const rf = std.fmt.bufPrint(&rf_buf, "rootflags=subvol={s}", .{rs}) catch "";
+            append = std.fmt.bufPrint(&app_buf, "{s}{s}{s}", .{ append, if (append.len > 0) " " else "", rf }) catch append;
+        }
+    }
+    if (boot_sub != null) {
+        err("dklilo: note: {s} is in btrfs subvolume '{s}'. The loader finds dklilo.conf only in the filesystem's default\n" ++
+            "        subvolume or on the ESP (\\EFI\\dklilo\\dklilo.conf); put the config there, or run\n" ++
+            "        `btrfs subvolume set-default` on that subvolume.\n", .{ boot, boot_sub.? });
+    }
+
     const windows = want_windows and detectWindows();
     var aw: Io.Writer.Allocating = .init(gpa_global);
     defer aw.deinit();
-    try genconfig.render(&aw.writer, kernels, .{ .prefix = prefix, .root = root_val, .append = append, .windows = windows });
+    try genconfig.render(&aw.writer, kernels, .{ .prefix = prefix, .root = root_val, .append = append, .subvol = boot_sub, .windows = windows });
 
     // The loader must be able to parse what we wrote.
     var diag = common.config.Diagnostic{};

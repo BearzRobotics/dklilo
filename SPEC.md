@@ -279,6 +279,7 @@ All readers are read-only and never write to the disk.
 | `dklilo check [conf]` | Parses the configuration and, using the same filesystem code as the loaders, confirms every `image` and `initrd` exists and every label is unique. |
 | `dklilo install-bios <disk>` | Writes stage 1 to the MBR (keeping the partition table and disk signature) and stage 2 to the post-MBR gap or the GPT BIOS boot partition. |
 | `dklilo install-uefi <esp>` | Copies `dkliloX64.efi` to `\EFI\dklilo\` and creates a boot entry by writing the `Boot####` and `BootOrder` variables through `/sys/firmware/efi/efivars`. `--removable` installs to `\EFI\BOOT\BOOTX64.EFI` instead, for USB sticks. |
+| `dklilo config [-o FILE]` | Writes a first `dklilo.conf` from `/boot` (kernels paired with initramfs files), the root `PARTUUID`, btrfs subvolume (`subvol=`, `rootflags=`) and Windows detection. Refuses to overwrite without `--force`. |
 | `dklilo mkiso-images <dir>` | Writes `eltorito.bin` and a FAT EFI image into a directory, ready for `xorriso` to build a hybrid ISO. |
 
 - Disks can be named as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX`, or any
