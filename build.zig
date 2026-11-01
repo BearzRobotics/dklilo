@@ -1,6 +1,12 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // `zig build` installs only bin/dklilo (it embeds every boot image).
+    // `zig build dev` also installs the loose images and the test fixtures
+    // that tests/qemu/*.sh expect under zig-out/.
+    const dev_step = b.step("dev", "Also install loose boot images and test fixtures");
+    dev_step.dependOn(b.getInstallStep());
+
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86,
         .os_tag = .freestanding,
@@ -20,7 +26,7 @@ pub fn build(b: *std.Build) void {
     stage1.setLinkerScript(b.path("src/bios/stage1.ld"));
 
     const bin = b.addObjCopy(stage1.getEmittedBin(), .{ .format = .binary });
-    b.getInstallStep().dependOn(&b.addInstallFile(bin.getOutput(), "stage1.bin").step);
+    dev_step.dependOn(&b.addInstallFile(bin.getOutput(), "stage1.bin").step);
 
     // El Torito boot sector for the ISO: reads stage 2 from the next CD sector.
     const cdstub = b.addExecutable(.{
@@ -58,7 +64,7 @@ pub fn build(b: *std.Build) void {
     stage2.entry = .{ .symbol_name = "_start" };
     stage2.setLinkerScript(b.path("src/bios/stage2.ld"));
     const stage2_bin = b.addObjCopy(stage2.getEmittedBin(), .{ .format = .binary });
-    b.getInstallStep().dependOn(&b.addInstallFile(stage2_bin.getOutput(), "stage2.bin").step);
+    dev_step.dependOn(&b.addInstallFile(stage2_bin.getOutput(), "stage2.bin").step);
 
     const efi = b.addExecutable(.{
         .name = "dkliloX64",
@@ -73,7 +79,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "common", .module = common }},
         }),
     });
-    b.installArtifact(efi);
+    dev_step.dependOn(&b.addInstallArtifact(efi, .{}).step);
 
     // The installer embeds the boot images, so it is one static file.
     const installer = b.addExecutable(.{
@@ -155,7 +161,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSmall,
         }),
     });
-    b.installArtifact(fake_bootmgr);
+    dev_step.dependOn(&b.addInstallArtifact(fake_bootmgr, .{}).step);
 
     // PID 1 for the Linux boot tests (tests/initramfs).
     const init = b.addExecutable(.{
@@ -168,5 +174,5 @@ pub fn build(b: *std.Build) void {
             .strip = true,
         }),
     });
-    b.installArtifact(init);
+    dev_step.dependOn(&b.addInstallArtifact(init, .{}).step);
 }

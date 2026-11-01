@@ -3,7 +3,7 @@
 # skipped (exit 77) when none is available; see tests/qemu/make-linux-disk.sh.
 set -u
 cd "$(dirname "$0")/.."
-zig build || exit 1
+zig build dev || exit 1
 zig build test || exit 1
 fail=0
 for t in tests/qemu/l*.sh; do
