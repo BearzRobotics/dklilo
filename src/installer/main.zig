@@ -3,6 +3,7 @@
 //!   dklilo check [conf] [--device DEV]
 //!   dklilo install-bios <disk> [--yes]
 //!   dklilo install-uefi <esp-dir> [--removable] [--entry-file F] [--device DEV] [--yes]
+//!   dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
 //!   dklilo mkiso-images <dir>
 //!   dklilo isohybrid <iso>
 //!
@@ -12,6 +13,7 @@ const std = @import("std");
 const common = @import("common");
 const plan = @import("plan.zig");
 const fat12 = @import("fat12.zig");
+const genconfig = @import("genconfig.zig");
 
 const Io = std.Io;
 
@@ -41,6 +43,7 @@ fn usage() u8 {
         \\  dklilo check [conf] [--device DEV]
         \\  dklilo install-bios <disk> [--yes]
         \\  dklilo install-uefi <esp-dir> [--removable] [--entry-file FILE] [--device DEV] [--yes]
+        \\  dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
         \\  dklilo mkiso-images <dir>
         \\  dklilo isohybrid <iso>
         \\
@@ -465,6 +468,181 @@ fn checkFile(set: *common.volumes.Set, def: *common.volumes.Volume, label: []con
     }
 }
 
+// ---- config ----------------------------------------------------------------
+
+/// `/dev/disk/by-partuuid/X -> ../../sda2` lookup: the PARTUUID of `dev`.
+fn partuuidOf(dev: []const u8, buf: []u8) ?[]const u8 {
+    var dir = Io.Dir.cwd().openDir(io_global, "/dev/disk/by-partuuid", .{ .iterate = true }) catch return null;
+    defer dir.close(io_global);
+    var it = dir.iterate();
+    const want = std.fs.path.basename(dev);
+    while (it.next(io_global) catch null) |e| {
+        var lb: [256]u8 = undefined;
+        const n = dir.readLink(io_global, e.name, &lb) catch continue;
+        if (std.mem.eql(u8, std.fs.path.basename(lb[0..n]), want) and e.name.len <= buf.len) {
+            @memcpy(buf[0..e.name.len], e.name);
+            return buf[0..e.name.len];
+        }
+    }
+    return null;
+}
+
+/// Is there a Windows install on any local disk? NTFS boot sector (BIOS) or
+/// \EFI\Microsoft\Boot\bootmgfw.efi on a FAT partition (UEFI).
+fn detectWindows() bool {
+    var sys = Io.Dir.cwd().openDir(io_global, "/sys/block", .{ .iterate = true }) catch return false;
+    defer sys.close(io_global);
+    var devs: std.ArrayList(*Device) = .empty;
+    defer {
+        for (devs.items) |d| {
+            d.close();
+            gpa_global.destroy(d);
+        }
+        devs.deinit(gpa_global);
+    }
+    var set = common.volumes.Set.init(gpa_global);
+    defer set.deinit();
+    var it = sys.iterate();
+    while (it.next(io_global) catch null) |e| {
+        const skip = [_][]const u8{ "loop", "ram", "zram", "sr", "dm-", "md", "nbd", "fd" };
+        var bad = false;
+        for (skip) |p| if (std.mem.startsWith(u8, e.name, p)) {
+            bad = true;
+        };
+        if (bad) continue;
+        var pb: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "/dev/{s}", .{e.name}) catch continue;
+        const d = gpa_global.create(Device) catch continue;
+        d.* = Device.open(path, false) catch {
+            gpa_global.destroy(d);
+            continue;
+        };
+        devs.append(gpa_global, d) catch {
+            d.close();
+            gpa_global.destroy(d);
+            continue;
+        };
+        _ = set.addDisk(d.blockDev()) catch continue;
+    }
+    for (set.vols.items) |*v| {
+        if (v.number != 0 and v.hasNtfsBootSector()) return true;
+        const fs = v.filesystem(gpa_global) orelse continue;
+        if (fs.* != .fat) continue;
+        if (fs.lookup("/EFI/Microsoft/Boot/bootmgfw.efi")) |ino| {
+            if (ino.is_regular) return true;
+        } else |_| {}
+    }
+    return false;
+}
+
+fn configCmd(args: []const [:0]const u8) !u8 {
+    var boot: []const u8 = "/boot";
+    var out_path: ?[]const u8 = null;
+    var force = false;
+    var root_dev: ?[]const u8 = null;
+    var append: []const u8 = "ro quiet";
+    var want_windows = true;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a: []const u8 = args[i];
+        const has_next = i + 1 < args.len;
+        if (std.mem.eql(u8, a, "--boot") and has_next) {
+            i += 1;
+            boot = args[i];
+        } else if (std.mem.eql(u8, a, "-o") and has_next) {
+            i += 1;
+            out_path = args[i];
+        } else if (std.mem.eql(u8, a, "--root") and has_next) {
+            i += 1;
+            root_dev = args[i];
+        } else if (std.mem.eql(u8, a, "--append") and has_next) {
+            i += 1;
+            append = args[i];
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, a, "--no-windows")) {
+            want_windows = false;
+        } else return usage();
+    }
+
+    // List the boot directory.
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| gpa_global.free(n);
+        names.deinit(gpa_global);
+    }
+    {
+        var dir = Io.Dir.cwd().openDir(io_global, boot, .{ .iterate = true }) catch |e| {
+            err("dklilo: cannot open {s}: {s}\n", .{ boot, @errorName(e) });
+            return 1;
+        };
+        defer dir.close(io_global);
+        var it = dir.iterate();
+        while (try it.next(io_global)) |e| try names.append(gpa_global, try gpa_global.dupe(u8, e.name));
+    }
+    const kernels = try genconfig.findKernels(gpa_global, names.items);
+    defer gpa_global.free(kernels);
+    if (kernels.len == 0) err("dklilo: warning: no kernels (vmlinuz*) found in {s}\n", .{boot});
+
+    // Is the boot directory its own filesystem? Then the config (kept in it)
+    // refers to kernels as "/vmlinuz-…", otherwise as "/boot/vmlinuz-…".
+    var abs_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const abs_len = Io.Dir.cwd().realPathFile(io_global, boot, &abs_buf) catch 0;
+    const abs = abs_buf[0..abs_len];
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const boot_src = mountSource(abs, &b1);
+    const root_src = mountSource("/", &b2);
+    const separate = boot_src != null and root_src != null and !std.mem.eql(u8, boot_src.?, root_src.?);
+    const prefix: []const u8 = if (separate) "" else if (abs.len > 0) std.mem.trimEnd(u8, abs, "/") else "/boot";
+
+    var uuid_buf: [64]u8 = undefined;
+    var root_buf: [128]u8 = undefined;
+    var root_val: ?[]const u8 = null;
+    const rdev = root_dev orelse root_src;
+    if (rdev) |rd| {
+        if (std.mem.startsWith(u8, rd, "PARTUUID=") or std.mem.startsWith(u8, rd, "UUID=") or std.mem.startsWith(u8, rd, "LABEL=")) {
+            root_val = rd;
+        } else if (partuuidOf(rd, &uuid_buf)) |u| {
+            root_val = std.fmt.bufPrint(&root_buf, "PARTUUID={s}", .{u}) catch null;
+        } else if (!std.mem.eql(u8, rd, "/dev/root")) {
+            root_val = rd;
+            err("dklilo: note: no PARTUUID for {s}; using the device name, which can change between boots\n", .{rd});
+        }
+    }
+    if (root_val == null) err("dklilo: warning: could not work out the root device; pass --root\n", .{});
+
+    const windows = want_windows and detectWindows();
+    var aw: Io.Writer.Allocating = .init(gpa_global);
+    defer aw.deinit();
+    try genconfig.render(&aw.writer, kernels, .{ .prefix = prefix, .root = root_val, .append = append, .windows = windows });
+
+    // The loader must be able to parse what we wrote.
+    var diag = common.config.Diagnostic{};
+    var parsed = common.config.parse(gpa_global, aw.written(), &diag) catch |e| {
+        err("dklilo: internal error: generated config does not parse (line {d}): {s}\n", .{ diag.line, @errorName(e) });
+        return 1;
+    };
+    parsed.deinit();
+
+    if (out_path) |op| {
+        if (!force) {
+            if (Io.Dir.cwd().access(io_global, op, .{})) {
+                err("dklilo: {s} exists; use --force to overwrite it\n", .{op});
+                return 1;
+            } else |_| {}
+        }
+        Io.Dir.cwd().writeFile(io_global, .{ .sub_path = op, .data = aw.written() }) catch |e| {
+            err("dklilo: cannot write {s}: {s}\n", .{ op, @errorName(e) });
+            return 1;
+        };
+        err("wrote {s}: {d} Linux entr{s}{s}; check it with `dklilo check {s}`\n", .{ op, kernels.len, if (kernels.len == 1) "y" else "ies", if (windows) " + Windows" else "", op });
+    } else {
+        Io.File.stdout().writeStreamingAll(io_global, aw.written()) catch {};
+    }
+    return 0;
+}
+
 // ---- ISO images ------------------------------------------------------------
 
 const cd_sector = 2048;
@@ -560,6 +738,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "check")) return check(rest);
     if (std.mem.eql(u8, cmd, "install-bios")) return installBios(rest);
     if (std.mem.eql(u8, cmd, "install-uefi")) return installUefi(rest);
+    if (std.mem.eql(u8, cmd, "config")) return configCmd(rest);
     if (std.mem.eql(u8, cmd, "mkiso-images")) return mkisoImages(rest);
     if (std.mem.eql(u8, cmd, "isohybrid")) return isohybrid(rest);
     return usage();
