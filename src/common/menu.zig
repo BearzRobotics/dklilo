@@ -115,12 +115,16 @@ fn draw(con: Console, cfg: *const config.Config, sel: usize, remaining: ?u32) vo
     const base: u16 = @intCast(3 + cfg.entries.len);
     con.moveTo(base, 0);
     con.puts("Up/Down: choose   Enter: boot   e: edit command line");
-    if (remaining) |r| {
-        con.moveTo(base + 1, 0);
-        var b: [48]u8 = undefined;
-        const s = std.fmt.bufPrint(&b, "Booting in {d} s (any key stops)   ", .{(r + 9) / 10}) catch "";
-        con.puts(s);
-    }
+    if (remaining) |r| drawCountdown(con, cfg, r);
+}
+
+/// Rewrites only the countdown line, so the menu doesn't flicker while the
+/// timer runs.
+fn drawCountdown(con: Console, cfg: *const config.Config, remaining: u32) void {
+    con.moveTo(@intCast(4 + cfg.entries.len), 0);
+    var b: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&b, "Booting in {d} s (any key stops)   ", .{(remaining + 9) / 10}) catch "";
+    con.puts(s);
 }
 
 /// Shows the menu and returns the chosen entry and its command line, or null
@@ -134,17 +138,24 @@ pub fn run(con: Console, cfg: *const config.Config, cmd_buf: []u8) ?Choice {
     if (immediate) return .{ .index = sel, .cmdline = buildCmdline(cfg.entries[sel], cmd_buf) };
 
     var remaining: ?u32 = cfg.timeout; // tenths of a second
+    var full = true; // redraw everything, or just the countdown line
     while (true) {
-        draw(con, cfg, sel, remaining);
+        if (full) draw(con, cfg, sel, remaining);
         const key = con.getKey(if (remaining != null) 100 else null);
         switch (key) {
             .timeout => {
                 const r = remaining.?;
                 if (r <= 1) return .{ .index = sel, .cmdline = buildCmdline(cfg.entries[sel], cmd_buf) };
                 remaining = r - 1;
+                full = false;
+                // Touch the screen only when the displayed second changes.
+                if ((r - 1 + 9) / 10 != (r + 9) / 10) drawCountdown(con, cfg, r - 1);
                 continue;
             },
-            else => remaining = null,
+            else => {
+                remaining = null;
+                full = true;
+            },
         }
         switch (key) {
             .up => sel = if (sel == 0) cfg.entries.len - 1 else sel - 1,

@@ -137,7 +137,11 @@ fn bootLinux(
         initrds[i] = try open(set, default, spec, subvol);
         total += std.mem.alignForward(u64, initrds[i].file.size, 4);
     }
-    const kernel_end: u64 = kernel_addr + @max(@as(u64, kernel.pm_size), kernel.header.init_size);
+    // A relocatable kernel moves itself to at least 16 MiB (aligned up) and
+    // needs init_size bytes there to decompress, so keep the initramfs above that.
+    const align_to: u64 = @max(kernel.header.kernel_alignment, 0x1000);
+    const run_at = std.mem.alignForward(u64, @max(@as(u64, kernel_addr), 0x1000000), align_to);
+    const kernel_end: u64 = @max(kernel_addr + @as(u64, kernel.pm_size), run_at + kernel.header.init_size);
     var initrd_at: u64 = 0;
     if (total > 0) {
         initrd_at = bp.placeInitrd(e820, kernel.header.initrd_addr_max, total, @max(kernel_end, initrd_floor)) orelse {
