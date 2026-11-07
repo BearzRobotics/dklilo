@@ -42,7 +42,11 @@ pub fn build(b: *std.Build) void {
     cdstub.setLinkerScript(b.path("src/bios/cdstub.ld"));
     const cdstub_bin = b.addObjCopy(cdstub.getEmittedBin(), .{ .format = .binary });
 
-    const common = b.createModule(.{ .root_source_file = b.path("src/common/root.zig") });
+    const fsread = b.dependency("fsread", .{}).module("fsread");
+    const common = b.createModule(.{
+        .root_source_file = b.path("src/common/root.zig"),
+        .imports = &.{.{ .name = "fsread", .module = fsread }},
+    });
     const stage2 = b.addExecutable(.{
         .name = "stage2.elf",
         .root_module = b.createModule(.{
@@ -128,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/common/root.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
+            .imports = &.{.{ .name = "fsread", .module = fsread }},
         }),
     });
     common_tests.root_module.addOptions("test_options", test_options);

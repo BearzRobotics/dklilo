@@ -16,9 +16,9 @@
 //! Specification: https://btrfs.readthedocs.io/en/latest/dev/On-disk-format.html
 
 const std = @import("std");
-const blockdev = @import("../blockdev.zig");
-const crc = @import("../crc.zig");
-const lzo = @import("../compress/lzo.zig");
+const region_mod = @import("region.zig");
+const crc = @import("crc.zig");
+const lzo = @import("lzo.zig");
 
 pub const Error = error{
     BadMagic,
@@ -31,7 +31,7 @@ pub const Error = error{
     NameTooLong,
     TooManyLinks,
     OutOfMemory,
-} || blockdev.Error;
+} || region_mod.Error;
 
 /// Key identifying every item in every tree (17 bytes on disk).
 pub const Key = extern struct {
@@ -228,7 +228,7 @@ const Stripe = struct { devid: u64, offset: u64 };
 
 pub const Fs = struct {
     allocator: std.mem.Allocator,
-    region: blockdev.Region,
+    region: region_mod.Region,
     sectorsize: u32,
     nodesize: u32,
     devid: u64,
@@ -248,7 +248,7 @@ pub const Fs = struct {
     /// Number of extents decompressed so far (tests check compression is used).
     debug_decompressed: usize = 0,
 
-    pub fn open(allocator: std.mem.Allocator, region: blockdev.Region) Error!Fs {
+    pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
         var raw: [4096]u8 = undefined;
         try region.readAt(sb_offset, &raw);
         const sb = std.mem.bytesAsValue(Superblock, raw[0..@sizeOf(Superblock)]).*;

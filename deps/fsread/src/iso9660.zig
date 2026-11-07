@@ -8,7 +8,7 @@
 //! Specification: ECMA-119; Rock Ridge: IEEE P1282 / SUSP (IEEE P1281).
 
 const std = @import("std");
-const blockdev = @import("../blockdev.zig");
+const region_mod = @import("region.zig");
 
 pub const Error = error{
     BadMagic,
@@ -20,7 +20,7 @@ pub const Error = error{
     NameTooLong,
     TooManyLinks,
     OutOfMemory,
-} || blockdev.Error;
+} || region_mod.Error;
 
 /// ISO 9660 logical block size (2048 on every medium dklilo reads).
 pub const block_size = 2048;
@@ -39,7 +39,7 @@ pub const Inode = struct {
 
 pub const Fs = struct {
     allocator: std.mem.Allocator,
-    region: blockdev.Region,
+    region: region_mod.Region,
     root: Inode,
     label_buf: [32]u8,
     label_len: usize,
@@ -47,7 +47,7 @@ pub const Fs = struct {
     sector: []u8,
     cont: []u8,
 
-    pub fn open(allocator: std.mem.Allocator, region: blockdev.Region) Error!Fs {
+    pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
         var pvd: [block_size]u8 = undefined;
         // Volume descriptors start at logical block 16; type 1 is the primary.
         var n: u32 = 16;
@@ -305,7 +305,7 @@ pub const Fs = struct {
 
 /// Quick check used when scanning disks: is there an ISO 9660 volume
 /// descriptor at logical block 16 of `region`?
-pub fn isIso(region: blockdev.Region) bool {
+pub fn isIso(region: region_mod.Region) bool {
     var d: [8]u8 = undefined;
     region.readAt(16 * block_size, &d) catch return false;
     return std.mem.eql(u8, d[1..6], "CD001");

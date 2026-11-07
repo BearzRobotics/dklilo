@@ -2,7 +2,7 @@
 //! caring whether it holds ext4 or btrfs, then look up and read files.
 
 const std = @import("std");
-const blockdev = @import("../blockdev.zig");
+const region_mod = @import("region.zig");
 const ext4 = @import("ext4.zig");
 const btrfs = @import("btrfs.zig");
 const iso9660 = @import("iso9660.zig");
@@ -27,7 +27,7 @@ pub const Fs = union(Kind) {
     fat: fat.Fs,
 
     /// Opens the filesystem on `region`, detecting its type.
-    pub fn open(allocator: std.mem.Allocator, region: blockdev.Region) Error!Fs {
+    pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
         if (ext4.Fs.open(allocator, region)) |f| {
             return .{ .ext4 = f };
         } else |e| switch (e) {

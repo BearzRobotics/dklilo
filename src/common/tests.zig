@@ -6,10 +6,12 @@
 const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
-const ext4 = @import("fs/ext4.zig");
-const fs_mod = @import("fs/fs.zig");
-const btrfs = @import("fs/btrfs.zig");
-const fat = @import("fs/fat.zig");
+const devio = @import("devio.zig");
+const fsread = @import("fsread");
+const ext4 = fsread.ext4;
+const fs_mod = fsread.fs;
+const btrfs = fsread.btrfs;
+const fat = fsread.fat;
 const test_options = @import("test_options");
 
 const manifest = @embedFile("manifest.txt");
@@ -22,7 +24,7 @@ fn disk(data: []const u8) blockdev.MemDisk {
 
 /// Checks every manifest file by hash and size through the generic `fs.Fs`.
 fn checkDisk(dev: blockdev.BlockDev) !void {
-    var fs = try fs_mod.Fs.open(gpa, dev.whole());
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&dev, dev.whole()));
     defer fs.deinit();
     try checkFs(&fs, null);
 }
@@ -89,6 +91,7 @@ const FileDisk = struct {
     corrupt_also: ?u64 = null,
     /// Byte overwrites applied to every read (used by the fuzz tests).
     patches: Patches = .{},
+    bd: blockdev.BlockDev = undefined,
 
     fn open(name: []const u8) !FileDisk {
         var path_buf: [512]u8 = undefined;
@@ -98,6 +101,12 @@ const FileDisk = struct {
     }
     fn close(self: *FileDisk) void {
         self.file.close(std.testing.io);
+    }
+    /// The whole image as a filesystem-reader region. `bd` keeps the device at
+    /// a stable address for the `Io` the region carries.
+    fn whole(self: *FileDisk) fsread.Region {
+        self.bd = self.blockDev();
+        return devio.fromRegion(&self.bd, self.bd.whole());
     }
     fn blockDev(self: *FileDisk) blockdev.BlockDev {
         return .{ .ctx = self, .readSectorsFn = read, .sector_size = 512, .sector_count = self.sectors };
@@ -141,7 +150,8 @@ test "ext4 inline_data: every file matches" {
 
 test "ext4: label, features, symlinks, holes, directories" {
     var d = disk(@embedFile("ext4.img"));
-    var fs = try ext4.Fs.open(gpa, d.blockDev().whole());
+    var bd = d.blockDev();
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
     defer fs.deinit();
     try std.testing.expectEqualStrings("dkltest", fs.label());
     try std.testing.expect(fs.metadata_csum);
@@ -194,12 +204,13 @@ test "ext4: corrupting metadata is reported, not ignored" {
     // Flip a bit in the superblock: checksum mismatch.
     copy[1024 + 100] ^= 1;
     var d = disk(copy);
-    try std.testing.expectError(error.ChecksumMismatch, ext4.Fs.open(gpa, d.blockDev().whole()));
+    var bd = d.blockDev();
+    try std.testing.expectError(error.ChecksumMismatch, ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole())));
     copy[1024 + 100] ^= 1;
 
     // Bad magic.
     copy[1024 + 56] ^= 0xFF;
-    try std.testing.expectError(error.BadMagic, ext4.Fs.open(gpa, d.blockDev().whole()));
+    try std.testing.expectError(error.BadMagic, ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole())));
 }
 
 test "mbr: primaries, extended and logical partitions" {
@@ -272,7 +283,8 @@ fn mutationRun(image: []const u8, seed: u64, iterations: usize) !void {
             copy[s.off] = s.val;
         };
         var d = disk(copy);
-        var fs = ext4.Fs.open(gpa, d.blockDev().whole()) catch continue;
+        var bd = d.blockDev();
+        var fs = ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole())) catch continue;
         defer fs.deinit();
         for ([_][]const u8{ "/boot/hello.txt", "/boot/big.bin", "/boot/sparse", "/many", "/boot/link-dir" }) |path| {
             const ino = fs.lookup(path) catch continue;
@@ -329,7 +341,7 @@ test "btrfs: compression is really in use" {
     for ([_][]const u8{ "btrfs-zlib.img", "btrfs-lzo.img", "btrfs-zstd.img" }) |name| {
         var d = try FileDisk.open(name);
         defer d.close();
-        var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+        var fs = try btrfs.Fs.open(gpa, d.whole());
         defer fs.deinit();
         const ino = try fs.lookup("/boot/compressible.txt");
         try std.testing.expectEqual(@as(u64, 1000000), ino.size);
@@ -344,7 +356,7 @@ test "btrfs: compression is really in use" {
 test "btrfs: label, symlinks, dot-dot, holes, big directory" {
     var d = try FileDisk.open("btrfs.img");
     defer d.close();
-    var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    var fs = try btrfs.Fs.open(gpa, d.whole());
     defer fs.deinit();
     try std.testing.expectEqualStrings("dklbtrfs", fs.label());
 
@@ -376,7 +388,7 @@ test "btrfs: subvolumes (crossing, selecting, default)" {
     {
         var d = try FileDisk.open("btrfs-subvol.img");
         defer d.close();
-        var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+        var fs = try fs_mod.Fs.open(gpa, d.whole());
         defer fs.deinit();
         // /boot is its own subvolume; paths through it still resolve.
         try checkFs(&fs, "/boot/");
@@ -390,7 +402,7 @@ test "btrfs: subvolumes (crossing, selecting, default)" {
         // `default:boot` makes the subvolume the default root.
         var d = try FileDisk.open("btrfs-default.img");
         defer d.close();
-        var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+        var fs = try fs_mod.Fs.open(gpa, d.whole());
         defer fs.deinit();
         const f = try fs.lookup("/hello.txt");
         try std.testing.expectEqual(@as(u64, 6), f.size);
@@ -402,7 +414,7 @@ test "btrfs: subvolumes (crossing, selecting, default)" {
 test "btrfs: a damaged metadata copy falls back to the DUP mirror" {
     var d = try FileDisk.open("btrfs-dup.img");
     defer d.close();
-    var probe = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    var probe = try btrfs.Fs.open(gpa, d.whole());
     var phys: [4]u64 = undefined;
     const copies = try probe.mapLogical(probe.root_tree, probe.nodesize, &phys);
     probe.deinit();
@@ -410,14 +422,14 @@ test "btrfs: a damaged metadata copy falls back to the DUP mirror" {
 
     // Corrupt the first copy of the root tree block.
     d.corrupt_at = phys[0] + 200;
-    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    var fs = try fs_mod.Fs.open(gpa, d.whole());
     defer fs.deinit();
     try checkFs(&fs, "/boot/sub/");
 
     // Corrupt both copies: opening must fail, not return garbage.
     d.corrupt_at = phys[0] + 200;
     d.corrupt_also = phys[1] + 200;
-    try std.testing.expectError(error.ChecksumMismatch, btrfs.Fs.open(gpa, d.blockDev().whole()));
+    try std.testing.expectError(error.ChecksumMismatch, btrfs.Fs.open(gpa, d.whole()));
 }
 
 test "btrfs: random metadata damage never crashes" {
@@ -429,11 +441,11 @@ test "btrfs: random metadata damage never crashes" {
         // Metadata lives in a few small regions of the sparse image; flip a
         // byte in a block the filesystem reads often (the tree blocks).
         d.corrupt_at = 0x10000 + rnd.uintLessThan(u64, 4096); // superblock
-        var fs = btrfs.Fs.open(gpa, d.blockDev().whole()) catch continue;
+        var fs = btrfs.Fs.open(gpa, d.whole()) catch continue;
         fs.deinit();
     }
     d.corrupt_at = null;
-    var fs = try btrfs.Fs.open(gpa, d.blockDev().whole());
+    var fs = try btrfs.Fs.open(gpa, d.whole());
     defer fs.deinit();
     const root = fs.root_tree;
     var phys: [4]u64 = undefined;
@@ -458,7 +470,7 @@ test "iso9660 + Rock Ridge: every file matches" {
 test "iso9660: label, symlinks, long names, big directory, case" {
     var d = try FileDisk.open("iso.img");
     defer d.close();
-    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    var fs = try fs_mod.Fs.open(gpa, d.whole());
     defer fs.deinit();
     try std.testing.expectEqualStrings("DKLISO", fs.label());
     // Rock Ridge symlinks (relative and absolute) resolve.
@@ -481,7 +493,7 @@ test "iso9660: label, symlinks, long names, big directory, case" {
 fn checkFat(name: []const u8, kind: fat.Kind) !void {
     var d = try FileDisk.open(name);
     defer d.close();
-    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    var fs = try fs_mod.Fs.open(gpa, d.whole());
     defer fs.deinit();
     try std.testing.expectEqual(kind, fs.fat.kind);
     try std.testing.expectEqualStrings("DKLFAT", fs.label());
@@ -501,7 +513,7 @@ test "fat32: every file matches" {
 test "fat: case-insensitive names, dot-dot, backslashes, and errors" {
     var d = try FileDisk.open("fat16.img");
     defer d.close();
-    var fs = try fs_mod.Fs.open(gpa, d.blockDev().whole());
+    var fs = try fs_mod.Fs.open(gpa, d.whole());
     defer fs.deinit();
     try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("/BOOT/HELLO.TXT")).size);
     try std.testing.expectEqual(@as(u64, 6), (try fs.lookup("\\boot\\sub\\..\\hello.txt")).size);
@@ -522,7 +534,7 @@ test "fat: random damage to the boot sector and directories never crashes" {
     const rnd = prng.random();
     for (0..60) |_| {
         d.corrupt_at = rnd.uintLessThan(u64, 64 * 1024);
-        var fs = fs_mod.Fs.open(gpa, d.blockDev().whole()) catch continue;
+        var fs = fs_mod.Fs.open(gpa, d.whole()) catch continue;
         defer fs.deinit();
         _ = fs.lookup("/boot/hello.txt") catch {};
         if (fs.lookup("/many")) |m| {
@@ -549,7 +561,7 @@ test "fat: random damage to the boot sector and directories never crashes" {
 // error or valid data. They never crash, hang, read out of bounds or leak.
 
 const fuzz_config = @import("config.zig");
-const lzo = @import("compress/lzo.zig");
+const lzo = fsread.lzo;
 
 fn fuzzConfig(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
@@ -627,7 +639,7 @@ fn exerciseFs(fs: *fs_mod.Fs) void {
             }
         }.cb) catch {},
         .iso9660 => |*f| f.walkDir(&dir.impl.iso9660, &count, struct {
-            fn cb(c: *usize, e: @import("fs/iso9660.zig").Fs.DirEntry) bool {
+            fn cb(c: *usize, e: fsread.iso9660.Fs.DirEntry) bool {
                 _ = e;
                 return Counter.stop(c);
             }
@@ -637,7 +649,7 @@ fn exerciseFs(fs: *fs_mod.Fs) void {
 
 fn fuzzFs(target: *FileDisk, smith: *std.testing.Smith) anyerror!void {
     fuzzPatches(target, smith);
-    var fs = fs_mod.Fs.open(gpa, target.blockDev().whole()) catch return;
+    var fs = fs_mod.Fs.open(gpa, target.whole()) catch return;
     defer fs.deinit();
     exerciseFs(&fs);
 }

@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const blockdev = @import("blockdev.zig");
-const crc = @import("crc.zig");
+const crc = @import("fsread").crc;
 
 pub const Error = error{
     /// No valid MBR signature, or GPT headers that fail validation.

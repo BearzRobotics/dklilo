@@ -7,7 +7,7 @@
 //! Specification: Microsoft "FAT: General Overview of On-Disk Format".
 
 const std = @import("std");
-const blockdev = @import("../blockdev.zig");
+const region_mod = @import("region.zig");
 
 pub const Error = error{
     BadMagic,
@@ -19,7 +19,7 @@ pub const Error = error{
     NameTooLong,
     TooManyLinks,
     OutOfMemory,
-} || blockdev.Error;
+} || region_mod.Error;
 
 pub const Kind = enum { fat12, fat16, fat32 };
 
@@ -43,7 +43,7 @@ const attr_lfn = 0x0F;
 
 pub const Fs = struct {
     allocator: std.mem.Allocator,
-    region: blockdev.Region,
+    region: region_mod.Region,
     kind: Kind,
     bytes_per_sector: u32,
     cluster_size: u32,
@@ -60,7 +60,7 @@ pub const Fs = struct {
     fat_buf: []u8,
     fat_sector: u64 = std.math.maxInt(u64),
 
-    pub fn open(allocator: std.mem.Allocator, region: blockdev.Region) Error!Fs {
+    pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
         var bs: [512]u8 = undefined;
         region.readAt(0, &bs) catch return error.BadMagic;
         if (bs[510] != 0x55 or bs[511] != 0xAA) return error.BadMagic;

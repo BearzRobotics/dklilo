@@ -13,8 +13,8 @@
 //! Specification: https://www.kernel.org/doc/html/latest/filesystems/ext4/
 
 const std = @import("std");
-const blockdev = @import("../blockdev.zig");
-const crc = @import("../crc.zig");
+const region_mod = @import("region.zig");
+const crc = @import("crc.zig");
 
 pub const Error = error{
     /// Not an ext2/3/4 superblock.
@@ -32,7 +32,7 @@ pub const Error = error{
     /// Too many nested symlinks (or a loop).
     TooManyLinks,
     OutOfMemory,
-} || blockdev.Error;
+} || region_mod.Error;
 
 /// ext4 superblock, at byte 1024 of the volume. 1024 bytes.
 const Superblock = extern struct {
@@ -278,7 +278,7 @@ pub const DirEntry = struct {
 
 pub const Fs = struct {
     allocator: std.mem.Allocator,
-    region: blockdev.Region,
+    region: region_mod.Region,
     block_size: u32,
     blocks_count: u64,
     first_data_block: u32,
@@ -300,7 +300,7 @@ pub const Fs = struct {
     ind_buf: []u8,
     ind_block: u64,
 
-    pub fn open(allocator: std.mem.Allocator, region: blockdev.Region) Error!Fs {
+    pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
         var sb_bytes: [1024]u8 = undefined;
         try region.readAt(1024, &sb_bytes);
         const sb = std.mem.bytesAsValue(Superblock, &sb_bytes).*;

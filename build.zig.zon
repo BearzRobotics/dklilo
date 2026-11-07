@@ -1,0 +1,11 @@
+.{
+    .name = .dklilo,
+    .version = "0.0.2",
+    .fingerprint = 0xeef64ac5c7d3f5b8,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        // Filesystem readers; kept as a separate package so other projects can use them.
+        .fsread = .{ .path = "deps/fsread" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "deps" },
+}

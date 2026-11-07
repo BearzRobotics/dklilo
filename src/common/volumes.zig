@@ -6,8 +6,10 @@
 const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
-const fs_mod = @import("fs/fs.zig");
-const iso9660 = @import("fs/iso9660.zig");
+const devio = @import("devio.zig");
+const fsread = @import("fsread");
+const fs_mod = fsread.fs;
+const iso9660 = fsread.iso9660;
 
 pub const Error = error{
     /// A path prefix names a volume that isn't there.
@@ -18,6 +20,9 @@ pub const Error = error{
 
 pub const Volume = struct {
     region: blockdev.Region,
+    /// The device `region` is on. Must stay at a fixed address: the
+    /// filesystem reader's `Io` points at it.
+    dev: *const blockdev.BlockDev,
     /// Which disk this volume is on, in the order disks were added.
     disk: usize,
     /// 1-based partition number, or 0 for a whole-disk filesystem.
@@ -46,7 +51,7 @@ pub const Volume = struct {
             .open => return &self.fs,
             .none => return null,
             .unprobed => {
-                if (fs_mod.Fs.open(allocator, self.region)) |fs| {
+                if (fs_mod.Fs.open(allocator, devio.fromRegion(self.dev, self.region))) |fs| {
                     self.fs = fs;
                     self.state = .open;
                     return &self.fs;
@@ -88,6 +93,8 @@ const Mount = struct {
     spec: []u8,
     subvol: ?[]u8,
     dev: FileDev,
+    /// `dev` as a block device; `vol` reads through it.
+    bd: blockdev.BlockDev,
     vol: Volume,
 };
 
@@ -96,6 +103,8 @@ pub const Set = struct {
     vols: std.ArrayList(Volume) = .empty,
     disks: usize = 0,
     mounts: std.ArrayList(*Mount) = .empty,
+    /// Copies of the disks added, at stable addresses for volumes to point at.
+    devs: std.ArrayList(*blockdev.BlockDev) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Set {
         return .{ .allocator = allocator };
@@ -109,6 +118,8 @@ pub const Set = struct {
             self.allocator.destroy(m);
         }
         self.mounts.deinit(self.allocator);
+        for (self.devs.items) |d| self.allocator.destroy(d);
+        self.devs.deinit(self.allocator);
         for (self.vols.items) |*v| if (v.state == .open) v.fs.deinit();
         self.vols.deinit(self.allocator);
     }
@@ -116,19 +127,24 @@ pub const Set = struct {
     /// Adds the partitions of `dev`. A disk with no partition table counts as
     /// one whole-disk volume (CD images, "superfloppies"). Returns the disk's
     /// index.
-    pub fn addDisk(self: *Set, dev: blockdev.BlockDev) std.mem.Allocator.Error!usize {
+    pub fn addDisk(self: *Set, disk_dev: blockdev.BlockDev) std.mem.Allocator.Error!usize {
+        const dp = try self.allocator.create(blockdev.BlockDev);
+        errdefer self.allocator.destroy(dp);
+        dp.* = disk_dev;
+        try self.devs.append(self.allocator, dp);
+        const dev = dp.*;
         const disk = self.disks;
         self.disks += 1;
         // An ISO 9660 volume (a DVD, or a hybrid ISO written to a stick) is
         // the whole device. On optical media (2048-byte sectors) that is all
         // there is; on a hybrid disk the partitions follow below.
-        if (iso9660.isIso(dev.whole())) {
-            try self.vols.append(self.allocator, .{ .region = dev.whole(), .disk = disk, .number = 0 });
+        if (iso9660.isIso(devio.fromRegion(dp, dev.whole()))) {
+            try self.vols.append(self.allocator, .{ .region = dev.whole(), .dev = dp, .disk = disk, .number = 0 });
             if (dev.sector_size >= 2048) return disk;
         }
         const table = part.read(dev) catch {
             if (self.vols.items.len > 0 and self.vols.items[self.vols.items.len - 1].disk == disk) return disk;
-            try self.vols.append(self.allocator, .{ .region = dev.whole(), .disk = disk, .number = 0 });
+            try self.vols.append(self.allocator, .{ .region = dev.whole(), .dev = dp, .disk = disk, .number = 0 });
             return disk;
         };
         for (table.slice()) |p| {
@@ -136,6 +152,7 @@ pub const Set = struct {
             if (table.kind == .mbr and (p.mbr_type == 0x05 or p.mbr_type == 0x0F or p.mbr_type == 0x85)) continue;
             try self.vols.append(self.allocator, .{
                 .region = p.region(dev),
+                .dev = dp,
                 .disk = disk,
                 .number = p.number,
                 .part_guid = if (table.kind == .gpt) p.part_guid else null,
@@ -244,8 +261,9 @@ pub const Set = struct {
         errdefer self.allocator.free(m.spec);
         m.subvol = if (subvol) |sv| try self.allocator.dupe(u8, sv) else null;
         m.dev = .{ .fs = o.fs, .file = o.file };
-        m.vol = .{ .region = m.dev.blockDev().whole(), .disk = std.math.maxInt(usize), .number = 0 };
-        if (!iso9660.isIso(m.vol.region)) {
+        m.bd = m.dev.blockDev();
+        m.vol = .{ .region = m.bd.whole(), .dev = &m.bd, .disk = std.math.maxInt(usize), .number = 0 };
+        if (!iso9660.isIso(devio.fromRegion(&m.bd, m.bd.whole()))) {
             if (m.subvol) |sv| self.allocator.free(sv);
             return error.NoFilesystem;
         }
