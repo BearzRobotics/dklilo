@@ -70,27 +70,86 @@ pub fn build(b: *std.Build) void {
     const stage2_bin = b.addObjCopy(stage2.getEmittedBin(), .{ .format = .binary });
     dev_step.dependOn(&b.addInstallFile(stage2_bin.getOutput(), "stage2.bin").step);
 
-    const efi = b.addExecutable(.{
-        .name = "dkliloX64",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/uefi/main.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .uefi,
-                .abi = .msvc,
+    // One UEFI loader per architecture. The source is architecture-neutral
+    // (it talks to UEFI protocols only), so the same entry file is built for
+    // each target; no per-arch source file is needed.
+    const efi_targets = [_]struct { arch: std.Target.Cpu.Arch, tag: []const u8 }{
+        .{ .arch = .x86_64, .tag = "X64" },
+        .{ .arch = .aarch64, .tag = "AA64" },
+        // 32-bit ARM UEFI is Thumb-2 only, so the Zig target is `thumb`
+        // (`arm-uefi` is rejected by the COFF linker).
+        .{ .arch = .thumb, .tag = "ARM" },
+        // riscv64 is built differently, below.
+    };
+    const efi_tags = [_][]const u8{ "X64", "AA64", "ARM", "RISCV64" };
+    var efi_files: [efi_tags.len]std.Build.LazyPath = undefined;
+    for (efi_targets, 0..) |t, i| {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("dklilo{s}", .{t.tag}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/uefi/main.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = t.arch, .os_tag = .uefi, .abi = .msvc }),
+                .optimize = .ReleaseSmall,
+                .imports = &.{.{ .name = "common", .module = common }},
             }),
-            .optimize = .ReleaseSmall,
-            .imports = &.{.{ .name = "common", .module = common }},
-        }),
-    });
-    dev_step.dependOn(&b.addInstallArtifact(efi, .{}).step);
+        });
+        dev_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        efi_files[i] = exe.getEmittedBin();
+    }
+
+    // RISC-V: Zig 0.17.1's COFF linker has no riscv64 support
+    // (docs/zig-uefi-targets.md), so compile to a PIC object, link a
+    // position-independent ELF with lld, and re-wrap it as a PE with
+    // tools/elf2efi.zig.
+    {
+        const obj = b.addObject(.{
+            .name = "dkliloRISCV64",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/uefi/main.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .riscv64, .os_tag = .uefi, .abi = .msvc }),
+                .optimize = .ReleaseSmall,
+                .pic = true,
+                .imports = &.{.{ .name = "common", .module = common }},
+            }),
+        });
+        obj.bundle_compiler_rt = true;
+        const link = b.addSystemCommand(&.{
+            b.graph.zig_exe,      "ld.lld",
+            "-pie",               "-e",
+            "EfiMain",            "-Bsymbolic",
+            "--gc-sections",      "-z",
+            "norelro",            "-z",
+            "separate-code",      "-z",
+            "max-page-size=4096", "-o",
+        });
+        const elf = link.addOutputFileArg("dkliloRISCV64.elf");
+        link.addFileArg(obj.getEmittedBin());
+        const tool = b.addExecutable(.{
+            .name = "elf2efi",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/elf2efi.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const conv = b.addRunArtifact(tool);
+        conv.addArg("riscv64");
+        conv.addFileArg(elf);
+        const riscv_efi = conv.addOutputFileArg("dkliloRISCV64.efi");
+        dev_step.dependOn(&b.addInstallFile(riscv_efi, "bin/dkliloRISCV64.efi").step);
+        efi_files[3] = riscv_efi;
+    }
 
     // The installer embeds the boot images, so it is one static file.
     const installer = b.addExecutable(.{
         .name = "dklilo",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/installer/main.zig"),
-            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none }),
+            // x86_64 by default; `-Dtarget=aarch64-linux-none` builds the tool for
+            // a Raspberry Pi or other ARM machine. It embeds every loader either way.
+            .target = b.standardTargetOptions(.{
+                .default_target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none },
+            }),
             .optimize = .ReleaseSmall,
             .imports = &.{.{ .name = "common", .module = common }},
         }),
@@ -98,14 +157,18 @@ pub fn build(b: *std.Build) void {
     installer.root_module.addAnonymousImport("stage1.bin", .{ .root_source_file = bin.getOutput() });
     installer.root_module.addAnonymousImport("cdstub.bin", .{ .root_source_file = cdstub_bin.getOutput() });
     installer.root_module.addAnonymousImport("stage2.bin", .{ .root_source_file = stage2_bin.getOutput() });
-    installer.root_module.addAnonymousImport("dkliloX64.efi", .{ .root_source_file = efi.getEmittedBin() });
+    for (efi_tags, efi_files) |tag, file| {
+        installer.root_module.addAnonymousImport(b.fmt("dklilo{s}.efi", .{tag}), .{ .root_source_file = file });
+    }
     b.installArtifact(installer);
 
     // Size limits from SPEC.md 5.1, enforced on every build.
-    for ([_]struct { name: []const u8, file: std.Build.LazyPath }{
-        .{ .name = "dkliloX64.efi", .file = efi.getEmittedBin() },
-        .{ .name = "stage2.bin", .file = stage2_bin.getOutput() },
-    }) |item| {
+    var size_checks: [efi_tags.len + 1]struct { name: []const u8, file: std.Build.LazyPath } = undefined;
+    for (efi_tags, efi_files, 0..) |tag, file, i| {
+        size_checks[i] = .{ .name = b.fmt("dklilo{s}.efi", .{tag}), .file = file };
+    }
+    size_checks[efi_tags.len] = .{ .name = "stage2.bin", .file = stage2_bin.getOutput() };
+    for (size_checks) |item| {
         const check = b.addSystemCommand(&.{
             "sh",                                                                                 "-c",
             "[ \"$(stat -c%s \"$1\")\" -le 524288 ] || { echo \"$2 exceeds 512 KiB\"; exit 1; }", "sh",
@@ -180,4 +243,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     dev_step.dependOn(&b.addInstallArtifact(init, .{}).step);
+
+    // The same PID 1 for AArch64 kernels (installed as init-aa64).
+    const init_aa64 = b.addExecutable(.{
+        .name = "init-aa64",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/initramfs/init.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .none }),
+            .optimize = .ReleaseSmall,
+            .single_threaded = true,
+            .strip = true,
+        }),
+    });
+    dev_step.dependOn(&b.addInstallArtifact(init_aa64, .{}).step);
 }

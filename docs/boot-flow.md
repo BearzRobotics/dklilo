@@ -66,8 +66,10 @@ same stage 2 copy inside the ISO.
 
 ## UEFI
 
-1. **Firmware** runs `dkliloX64.efi` from the ESP (`\EFI\BOOT\BOOTX64.EFI`,
-   or `\EFI\dklilo\dkliloX64.efi` through a boot entry).
+1. **Firmware** runs the loader for its architecture from the ESP
+   (`\EFI\BOOT\BOOT<ARCH>.EFI`, or `\EFI\dklilo\dklilo<ARCH>.efi` through a boot
+   entry; `<ARCH>` is `X64`, `AA64`, `ARM` or `RISCV64`). The rest of this section is the
+   same on every architecture.
 2. **Disks.** dklilo asks the firmware for every `BlockIo` handle that is a
    whole disk and reads those with its own partition and filesystem code.
    The firmware's partition handles are ignored. Which disk it started from

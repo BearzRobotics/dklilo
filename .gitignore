@@ -5,6 +5,7 @@ zig-out/
 vmlinuz*
 bzImage*
 initramfs*
+!tests/initramfs/
 initrd*
 *.deb
 tests/kernel/

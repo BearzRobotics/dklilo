@@ -12,11 +12,11 @@ dklilo - install and check the dklilo boot loader
 
 **dklilo install-bios** *disk* [**--yes**]
 
-**dklilo install-uefi** *esp-dir* [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
+**dklilo install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
 
 **dklilo config** [**--boot** *DIR*] [**-o** *FILE*] [**--force**] [**--root** *DEV*] [**--append** *STR*] [**--no-windows**]
 
-**dklilo mkiso-images** *dir*
+**dklilo mkiso-images** *dir* [**--arch** *ARCH*]
 
 **dklilo isohybrid** *iso*
 
@@ -59,10 +59,11 @@ writes first and asks for confirmation (see **--yes**).
     there is not enough room, if a GPT disk has no BIOS boot partition, or if
     the disk has no partition table.
 
-**install-uefi** *esp-dir* [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
+**install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
 :   Copies the UEFI loader to the mounted EFI System Partition *esp-dir*:
-    `EFI/dklilo/dkliloX64.efi`, or `EFI/BOOT/BOOTX64.EFI` with
-    **--removable**. Without **--removable** it also creates a firmware boot
+    `EFI/dklilo/dklilo<ARCH>.efi` (`dkliloX64.efi`, `dkliloAA64.efi`,
+    `dkliloARM.efi`, `dkliloRISCV64.efi`), or
+    `EFI/BOOT/BOOT<ARCH>.EFI` with **--removable**. Without **--removable** it also creates a firmware boot
     entry and puts it first in BootOrder through efivarfs
     (`/sys/firmware/efi/efivars`).
 
@@ -73,7 +74,7 @@ writes first and asks for confirmation (see **--yes**).
     `rootflags=subvol=` as needed. The result is parsed with the loader's own
     parser before it is written.
 
-**mkiso-images** *dir*
+**mkiso-images** *dir* [**--arch** *ARCH*]
 :   Writes `eltorito.bin`, `efiboot.img` and `mbr.bin` into the existing
     directory *dir*: the pieces **xorriso**(1) needs for a hybrid BIOS and
     UEFI ISO.
@@ -90,8 +91,17 @@ writes first and asks for confirmation (see **--yes**).
     it, the command prints what it will write and waits for `yes` on standard
     input. Anything else aborts with nothing written.
 
+**--arch** *ARCH*
+:   (**install-uefi**, **mkiso-images**) Which UEFI loader to install:
+    `x64` (also `x86_64`, `amd64`), `aa64` (also `aarch64`, `arm64`), `arm`
+    (32-bit ARM, Thumb-2) or `riscv64`.
+    Default: the architecture the **dklilo** tool itself was built for, so
+    that a tool built for a Raspberry Pi installs the AArch64 loader. Every
+    loader is embedded in every build, so a disk or ISO for another
+    architecture can be prepared from any host.
+
 **--removable**
-:   (**install-uefi**) Install as `\EFI\BOOT\BOOTX64.EFI` for removable media
+:   (**install-uefi**) Install as `\EFI\BOOT\BOOT<ARCH>.EFI` for removable media
     and create no boot entry.
 
 **--entry-file** *FILE*
@@ -161,6 +171,10 @@ Install for BIOS, then for UEFI:
     dklilo install-bios /dev/sda
     dklilo install-uefi /boot/efi
 
+Prepare an AArch64 machine's ESP (for example a Raspberry Pi running UEFI firmware):
+
+    dklilo install-uefi /boot/efi --arch aa64
+
 Prepare a USB stick's ESP without touching the firmware's boot entries:
 
     dklilo install-uefi /mnt/usb --removable
@@ -212,15 +226,19 @@ Secure Boot.
 
 # COMPATIBILITY
 
-Linux host for the tool (x86_64). The loader boots 64-bit x86 Linux kernels
-and chainloads Windows, on BIOS (MBR or GPT) and UEFI (x86_64). The tool is
-built with Zig 0.17.1.
+Linux host for the tool. It is built for x86_64 by default, and for another
+architecture with `zig build -Dtarget=aarch64-linux-none`. The loader boots
+Linux and chainloads Windows on BIOS (MBR or GPT, x86 only) and on UEFI
+(x86_64, AArch64, 32-bit ARM and RISC-V 64). Of these, x86_64 and AArch64
+are run in the project's tests with real firmware; 32-bit ARM is only built
+and its file names checked, and RISC-V runs under QEMU only. Built with
+Zig 0.17.1.
 
 # LIMITATIONS
 
 See the non-goals in the project's README and SPEC.md: no Secure Boot, no
 encrypted or LVM/RAID `/boot`, no btrfs RAID0/5/6, no NTFS or XFS readers, no
-network boot, no 32-bit kernels, no other architectures.
+network boot, no 32-bit kernels. BIOS support is x86 only; UEFI is x86_64, AArch64, 32-bit ARM and RISC-V 64, with the testing limits above.
 
 # SEE ALSO
 

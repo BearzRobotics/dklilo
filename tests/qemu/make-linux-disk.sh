@@ -9,13 +9,19 @@
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
 out="$1"; conf="$2"
-kernel="${DKLILO_KERNEL:-$HOME/.cache/dklilo/vmlinuz}"
-[ -f "$kernel" ] || { echo "SKIP: no kernel at $kernel (set DKLILO_KERNEL)"; exit 77; }
+# ARCH=aa64 builds an AArch64 disk: its kernel is $DKLILO_KERNEL_AA64 (default
+# ~/.cache/dklilo/Image-aa64) and its PID 1 is zig-out/bin/init-aa64.
+arch="${ARCH:-x64}"
+case "$arch" in
+    aa64) kernel="${DKLILO_KERNEL_AA64:-$HOME/.cache/dklilo/Image-aa64}"; efi=dkliloAA64.efi; fallback=BOOTAA64.EFI; init=init-aa64;;
+    *)    kernel="${DKLILO_KERNEL:-$HOME/.cache/dklilo/vmlinuz}"; efi=dkliloX64.efi; fallback=BOOTX64.EFI; init=init;;
+esac
+[ -f "$kernel" ] || { echo "SKIP: no kernel at $kernel (set DKLILO_KERNEL$([ "$arch" = aa64 ] && echo _AA64))"; exit 77; }
 w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
 
 # Two initramfs files: the first has /init, the second only a marker. The
 # kernel must unpack both (they are concatenated by the loader).
-python3 "$here/tests/initramfs/mkcpio.py" "$w/initrd1.cpio" --init "$here/zig-out/bin/init" --file marker1=from-initrd-1
+python3 "$here/tests/initramfs/mkcpio.py" "$w/initrd1.cpio" --init "$here/zig-out/bin/$init" --file marker1=from-initrd-1
 gzip -c "$w/initrd1.cpio" > "$w/initrd1.img"
 python3 "$here/tests/initramfs/mkcpio.py" "$w/initrd2.cpio" --file marker2=from-initrd-2
 
@@ -35,7 +41,7 @@ truncate -s 33M "$w/esp.img"
 mkfs.fat -F 16 -n ESP "$w/esp.img" >/dev/null
 mmd -i "$w/esp.img" ::/EFI ::/EFI/BOOT
 # NO_LOADER=1 leaves the ESP without the loader (the installer test adds it).
-[ -n "${NO_LOADER:-}" ] || mcopy -i "$w/esp.img" "$here/zig-out/bin/dkliloX64.efi" ::/EFI/BOOT/BOOTX64.EFI
+[ -n "${NO_LOADER:-}" ] || mcopy -i "$w/esp.img" "$here/zig-out/bin/$efi" "::/EFI/BOOT/$fallback"
 if [ -n "${CONFIG_IN_ESP:-}" ]; then
     mmd -i "$w/esp.img" ::/EFI/dklilo
     mcopy -i "$w/esp.img" "$conf" ::/EFI/dklilo/dklilo.conf

@@ -83,7 +83,7 @@ spec first.
 - **Reading NTFS or XFS.** Windows is booted by chainloading, which doesn't
   need NTFS.
 - **Network boot**, **Multiboot**, **32-bit (i386) kernels**, and
-  architectures other than x86_64. aarch64 UEFI is a possible later goal.
+  BIOS on anything but x86. (UEFI on x86_64, AArch64, 32-bit ARM and RISC-V 64 is supported, see docs/zig-uefi-targets.md.)
 
 ## 3. Stack
 
@@ -123,7 +123,7 @@ code (see 8).
 |---|---|
 | `stage1.bin` | 440-byte MBR boot code (BIOS) |
 | `stage2.bin` | BIOS loader, a flat binary, loaded by stage 1 |
-| `dkliloX64.efi` | UEFI loader (PE32+ application) |
+| `dkliloX64.efi`, `dkliloAA64.efi`, `dkliloARM.efi`, `dkliloRISCV64.efi` | UEFI loaders (PE applications), one per architecture, built from the same source |
 | `eltorito.bin` | BIOS boot image for the ISO (stage 2 with a CD-specific start) |
 | `dklilo` | The installer and checking tool, run under Linux |
 
@@ -181,7 +181,7 @@ ordinary unit tests long before they run on bare metal.
 |---|---|---|
 | `stage1.bin` | 440 bytes | The MBR code area before the disk signature. |
 | `stage2.bin` | 512 KiB | Must fit in the 1 MiB gap after the MBR, or in a BIOS boot partition. |
-| `dkliloX64.efi` | 512 KiB | Keeps the ESP footprint small; enforced by a build check. |
+| `dklilo<ARCH>.efi` | 512 KiB each | Keeps the ESP footprint small; enforced by a build check. |
 
 ### 5.2 Configuration file
 

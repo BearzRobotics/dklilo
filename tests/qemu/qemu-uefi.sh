@@ -4,6 +4,16 @@
 set -eu
 disk="$1"; serial="$2"; t="${3:-60}"; shift; shift; [ $# -gt 0 ] && shift || true
 v=$(mktemp); trap 'rm -f "$v"' EXIT
+if [ "${ARCH:-x64}" = aa64 ]; then
+    # AArch64 "virt" machine with AAVMF; the serial port is a PL011.
+    cp /usr/share/AAVMF/AAVMF_VARS.fd "$v"
+    timeout "$t" qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 1024 -display none -no-reboot \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
+        -drive if=pflash,format=raw,file="$v" \
+        -drive format=raw,file="$disk" \
+        -serial "file:$serial" "$@" >/dev/null 2>&1 || true
+    exit 0
+fi
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$v"
 timeout "$t" qemu-system-x86_64 -machine q35 -m 1024 -display none -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \

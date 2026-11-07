@@ -29,7 +29,11 @@ other   = windows                # finds Windows automatically
 
 ## Features
 
-- **BIOS** (MBR and GPT) and **UEFI** (x86_64) from one code base.
+- **BIOS** (MBR and GPT, x86) and **UEFI** (x86_64, **AArch64**, 32-bit ARM and
+  **RISC-V 64**; for example a Raspberry Pi running UEFI firmware) from one code
+  base. AArch64 and RISC-V are tested under QEMU with edk2, 32-bit ARM is only
+  built; see [docs/zig-uefi-targets.md](docs/zig-uefi-targets.md) for how each
+  is built (RISC-V needs a converter because Zig cannot link it yet).
 - **Reads filesystems at boot:** ext2/3/4, btrfs (single, DUP and RAID1;
   zlib, LZO and zstd compression; subvolumes), FAT12/16/32 with long names,
   and ISO 9660 with Rock Ridge.
@@ -50,14 +54,15 @@ other   = windows                # finds Windows automatically
 
 Secure Boot, graphical menus, encrypted `/boot` (LUKS), `/boot` on LVM or
 software RAID, btrfs RAID0/5/6, NTFS/XFS readers, network boot, Multiboot,
-32-bit kernels and non-x86_64 architectures. See [SPEC.md](SPEC.md) section 2.
+32-bit x86 kernels, and BIOS on anything but x86. See [SPEC.md](SPEC.md) section 2.
 
 ## Building
 
 You need [Zig](https://ziglang.org/) **0.17.1**.
 
 ```sh
-zig build            # everything: stage1/stage2, dkliloX64.efi, the dklilo tool
+zig build            # everything: stage1/stage2, the UEFI loaders, the dklilo tool
+zig build -Dtarget=aarch64-linux-none   # the tool for an AArch64 machine
 zig build test       # unit tests against images made by real mkfs tools
 ```
 
@@ -83,6 +88,7 @@ dklilo install-bios /dev/sda
 # UEFI: copy dkliloX64.efi to the ESP and create a boot entry
 dklilo install-uefi /boot/efi
 dklilo install-uefi /mnt/usb --removable     # \EFI\BOOT\BOOTX64.EFI, for USB sticks
+dklilo install-uefi /boot/efi --arch aa64    # also arm, riscv64; default: the tool's own architecture
 ```
 
 Disks can be named as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX`, or any
@@ -153,6 +159,7 @@ chainloading is tested against a stub, and by hand against a real Windows VM.
   kernel.
 - [docs/manpages/dklilo.conf.5.md](docs/manpages/dklilo.conf.5.md): configuration reference.
 - [docs/manpages/dklilo.1.md](docs/manpages/dklilo.1.md): the `dklilo` command.
+- [docs/zig-uefi-targets.md](docs/zig-uefi-targets.md): which UEFI targets Zig 0.17.1 can build.
 - [docs/std-io-freestanding.md](docs/std-io-freestanding.md): limits of `std.Io` on freestanding targets.
 - [deps/fsread](deps/fsread): the filesystem readers, reusable as a package.
 - `original/`: LILO 24.2 and Slackware patches, kept as reference material

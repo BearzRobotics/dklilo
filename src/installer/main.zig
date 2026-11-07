@@ -14,13 +14,32 @@ const common = @import("common");
 const plan = @import("plan.zig");
 const fat12 = @import("fat12.zig");
 const genconfig = @import("genconfig.zig");
+const arch_mod = @import("arch.zig");
+const Arch = arch_mod.Arch;
 
 const Io = std.Io;
 
 const stage1_image = @embedFile("stage1.bin");
 const stage2_image = @embedFile("stage2.bin");
 const cdstub_image = @embedFile("cdstub.bin");
-const efi_image = @embedFile("dkliloX64.efi");
+/// The UEFI loader for each architecture; every one is embedded so the tool can
+/// prepare a disk for a machine of a different architecture.
+fn efiImage(a: Arch) []const u8 {
+    return switch (a) {
+        .x64 => @embedFile("dkliloX64.efi"),
+        .aa64 => @embedFile("dkliloAA64.efi"),
+        .arm => @embedFile("dkliloARM.efi"),
+        .riscv64 => @embedFile("dkliloRISCV64.efi"),
+    };
+}
+
+/// Parses `--arch` values, or reports the valid ones.
+fn parseArch(v: []const u8) ?Arch {
+    return arch_mod.parse(v) orelse {
+        err("dklilo: unknown architecture '{s}' (use x64, aa64, arm or riscv64)\n", .{v});
+        return null;
+    };
+}
 
 var io_global: Io = undefined;
 var gpa_global: std.mem.Allocator = undefined;
@@ -42,9 +61,9 @@ fn usage() u8 {
         \\usage:
         \\  dklilo check [conf] [--device DEV]
         \\  dklilo install-bios <disk> [--yes]
-        \\  dklilo install-uefi <esp-dir> [--removable] [--entry-file FILE] [--device DEV] [--yes]
+        \\  dklilo install-uefi <esp-dir> [--arch ARCH] [--removable] [--entry-file FILE] [--device DEV] [--yes]
         \\  dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
-        \\  dklilo mkiso-images <dir>
+        \\  dklilo mkiso-images <dir> [--arch ARCH]
         \\  dklilo isohybrid <iso>
         \\
     , .{});
@@ -244,10 +263,14 @@ fn installUefi(args: []const [:0]const u8) !u8 {
     var yes = false;
     var entry_file: ?[]const u8 = null;
     var device: ?[]const u8 = null;
+    var arch = arch_mod.native();
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a: []const u8 = args[i];
-        if (std.mem.eql(u8, a, "--removable")) {
+        if (std.mem.eql(u8, a, "--arch") and i + 1 < args.len) {
+            i += 1;
+            arch = parseArch(args[i]) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--removable")) {
             removable = true;
         } else if (std.mem.eql(u8, a, "--yes")) {
             yes = true;
@@ -263,8 +286,15 @@ fn installUefi(args: []const [:0]const u8) !u8 {
     }
     const esp_dir = esp orelse return usage();
 
-    const target_rel: []const u8 = if (removable) "EFI/BOOT/BOOTX64.EFI" else "EFI/dklilo/dkliloX64.efi";
-    out("Installing the UEFI boot loader into {s}:\n  copy dkliloX64.efi ({d} bytes) to {s}/{s}\n", .{ esp_dir, efi_image.len, esp_dir, target_rel });
+    const efi_image = efiImage(arch);
+    var name_buf: [64]u8 = undefined;
+    var rel_buf: [96]u8 = undefined;
+    const installed = arch_mod.installedName(&name_buf, arch);
+    const target_rel: []const u8 = if (removable)
+        std.fmt.bufPrint(&rel_buf, "EFI/BOOT/{s}", .{arch_mod.fallbackName(&name_buf, arch)}) catch unreachable
+    else
+        std.fmt.bufPrint(&rel_buf, "EFI/dklilo/{s}", .{installed}) catch unreachable;
+    out("Installing the {s} UEFI boot loader into {s}:\n  copy {d} bytes to {s}/{s}\n", .{ arch.tag(), esp_dir, efi_image.len, esp_dir, target_rel });
 
     // The boot entry (not needed for removable media).
     var load_option_buf: [512]u8 = undefined;
@@ -299,8 +329,10 @@ fn installUefi(args: []const [:0]const u8) !u8 {
             err("dklilo: partition {d} not found on {s}\n", .{ sp.number, sp.disk });
             return 1;
         };
-        load_option = plan.buildLoadOption(&load_option_buf, "dklilo", pi, "\\EFI\\dklilo\\dkliloX64.efi");
-        out("  boot entry: partition {d} of {s}, \\EFI\\dklilo\\dkliloX64.efi\n", .{ pi.number, sp.disk });
+        var loader_path_buf: [96]u8 = undefined;
+        const loader_path = std.fmt.bufPrint(&loader_path_buf, "\\EFI\\dklilo\\{s}", .{installed}) catch unreachable;
+        load_option = plan.buildLoadOption(&load_option_buf, "dklilo", pi, loader_path);
+        out("  boot entry: partition {d} of {s}, {s}\n", .{ pi.number, sp.disk, loader_path });
     }
     if (load_option != null) {
         if (entry_file) |f| out("  write the EFI_LOAD_OPTION to {s}\n", .{f}) else out("  create a Boot#### variable and put it first in BootOrder (efivarfs)\n", .{});
@@ -716,11 +748,20 @@ const cd_sector = 2048;
 
 /// Writes the three files `xorriso` needs to build a bootable hybrid ISO:
 ///   eltorito.bin  El Torito BIOS image: a boot sector, then stage 2
-///   efiboot.img   FAT image holding \EFI\BOOT\BOOTX64.EFI
+///   efiboot.img   FAT image holding \EFI\BOOT\BOOT<arch>.EFI
 ///   mbr.bin       stage 1 as the 440-byte MBR code of the hybrid ISO
 fn mkisoImages(args: []const [:0]const u8) !u8 {
-    if (args.len != 1) return usage();
-    const dir_path: []const u8 = args[0];
+    var dir_arg: ?[]const u8 = null;
+    var arch = arch_mod.native();
+    var k: usize = 0;
+    while (k < args.len) : (k += 1) {
+        const a: []const u8 = args[k];
+        if (std.mem.eql(u8, a, "--arch") and k + 1 < args.len) {
+            k += 1;
+            arch = parseArch(args[k]) orelse return 2;
+        } else if (dir_arg == null) dir_arg = a else return usage();
+    }
+    const dir_path = dir_arg orelse return usage();
     var dir = Io.Dir.cwd().openDir(io_global, dir_path, .{}) catch |e| {
         err("dklilo: cannot open {s}: {s}\n", .{ dir_path, @errorName(e) });
         return 1;
@@ -738,7 +779,8 @@ fn mkisoImages(args: []const [:0]const u8) !u8 {
     @memcpy(el[cd_sector..][0..stage2_image.len], stage2_image);
     try dir.writeFile(io_global, .{ .sub_path = "eltorito.bin", .data = el });
 
-    const efi = fat12.buildEfiImage(gpa_global, efi_image) catch |e| {
+    var fb_buf: [64]u8 = undefined;
+    const efi = fat12.buildEfiImage(gpa_global, efiImage(arch), arch_mod.fallbackName(&fb_buf, arch)) catch |e| {
         err("dklilo: cannot build the EFI image: {s}\n", .{@errorName(e)});
         return 1;
     };
