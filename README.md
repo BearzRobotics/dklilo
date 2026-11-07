@@ -172,7 +172,13 @@ directed and reviewed by the maintainer. The rules that govern that work are
 in [ai/AGENTS.md](ai/AGENTS.md): code must be understandable without the AI
 that wrote it, claims must cite primary sources, and significant design
 changes are explained before they are made. Contributors who use AI tools are
-expected to follow the same rules, and to say so in their pull requests.
+required to follow the same rules.
+
+**Disclosure is required.** If you used AI to write or substantially shape a
+contribution (code, documentation, tests or commit messages), say so in the
+pull request: which tool, and what it did. AI use is welcome here; hiding it
+is not. You remain responsible for understanding and being able to explain
+everything you submit.
 
 ## License
 
