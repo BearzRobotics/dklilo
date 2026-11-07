@@ -31,8 +31,8 @@ other   = windows                # finds Windows automatically
 
 - **BIOS** (MBR and GPT, x86) and **UEFI** (x86_64, **AArch64**, 32-bit ARM and
   **RISC-V 64**; for example a Raspberry Pi running UEFI firmware) from one code
-  base. AArch64 and RISC-V are tested under QEMU with edk2, 32-bit ARM is only
-  built; see [docs/zig-uefi-targets.md](docs/zig-uefi-targets.md) for how each
+  base. AArch64 and RISC-V boot Linux under QEMU with edk2 (not tried on real
+  hardware), 32-bit ARM is only built; see [docs/zig-uefi-targets.md](docs/zig-uefi-targets.md) for how each
   is built (RISC-V needs a converter because Zig cannot link it yet).
 - **Reads filesystems at boot:** ext2/3/4, btrfs (single, DUP and RAID1;
   zlib, LZO and zstd compression; subvolumes), FAT12/16/32 with long names,

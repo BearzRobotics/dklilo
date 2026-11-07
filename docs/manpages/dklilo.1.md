@@ -229,10 +229,10 @@ Secure Boot.
 Linux host for the tool. It is built for x86_64 by default, and for another
 architecture with `zig build -Dtarget=aarch64-linux-none`. The loader boots
 Linux and chainloads Windows on BIOS (MBR or GPT, x86 only) and on UEFI
-(x86_64, AArch64, 32-bit ARM and RISC-V 64). Of these, x86_64 and AArch64
-are run in the project's tests with real firmware; 32-bit ARM is only built
-and its file names checked, and RISC-V runs under QEMU only. Built with
-Zig 0.17.1.
+(x86_64, AArch64, 32-bit ARM and RISC-V 64). x86_64, AArch64 and
+RISC-V 64 are tested by booting Linux under QEMU with edk2 firmware; 32-bit
+ARM is only built and its file names checked. None of the non-x86 loaders has
+been run on real hardware. Built with Zig 0.17.1.
 
 # LIMITATIONS
 

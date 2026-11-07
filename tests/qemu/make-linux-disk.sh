@@ -10,13 +10,15 @@ set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
 out="$1"; conf="$2"
 # ARCH=aa64 builds an AArch64 disk: its kernel is $DKLILO_KERNEL_AA64 (default
-# ~/.cache/dklilo/Image-aa64) and its PID 1 is zig-out/bin/init-aa64.
+# ~/.cache/dklilo/Image-aa64) and its PID 1 is zig-out/bin/init-aa64. ARCH=riscv64
+# likewise with $DKLILO_KERNEL_RISCV64 and init-riscv64.
 arch="${ARCH:-x64}"
 case "$arch" in
     aa64) kernel="${DKLILO_KERNEL_AA64:-$HOME/.cache/dklilo/Image-aa64}"; efi=dkliloAA64.efi; fallback=BOOTAA64.EFI; init=init-aa64;;
+    riscv64) kernel="${DKLILO_KERNEL_RISCV64:-$HOME/.cache/dklilo/Image-riscv64}"; efi=dkliloRISCV64.efi; fallback=BOOTRISCV64.EFI; init=init-riscv64;;
     *)    kernel="${DKLILO_KERNEL:-$HOME/.cache/dklilo/vmlinuz}"; efi=dkliloX64.efi; fallback=BOOTX64.EFI; init=init;;
 esac
-[ -f "$kernel" ] || { echo "SKIP: no kernel at $kernel (set DKLILO_KERNEL$([ "$arch" = aa64 ] && echo _AA64))"; exit 77; }
+[ -f "$kernel" ] || { echo "SKIP: no kernel at $kernel (set DKLILO_KERNEL$(case $arch in aa64) echo _AA64;; riscv64) echo _RISCV64;; esac))"; exit 77; }
 w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
 
 # Two initramfs files: the first has /init, the second only a marker. The

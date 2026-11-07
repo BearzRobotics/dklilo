@@ -14,6 +14,19 @@ if [ "${ARCH:-x64}" = aa64 ]; then
         -serial "file:$serial" "$@" >/dev/null 2>&1 || true
     exit 0
 fi
+if [ "${ARCH:-x64}" = riscv64 ]; then
+    # RISC-V "virt" with edk2; the firmware images must be padded to 32 MiB.
+    c=$(mktemp); trap 'rm -f "$v" "$c"' EXIT
+    cp /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd "$c"; cp /usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd "$v"
+    truncate -s 32M "$c" "$v"
+    timeout "$t" qemu-system-riscv64 -machine virt,acpi=off -m 1024 -display none -no-reboot \
+        -blockdev node-name=pf0,driver=file,read-only=on,filename="$c" \
+        -blockdev node-name=pf1,driver=file,filename="$v" \
+        -machine pflash0=pf0,pflash1=pf1 \
+        -drive file="$disk",format=raw,if=virtio \
+        -serial "file:$serial" "$@" >/dev/null 2>&1 || true
+    exit 0
+fi
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$v"
 timeout "$t" qemu-system-x86_64 -machine q35 -m 1024 -display none -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \

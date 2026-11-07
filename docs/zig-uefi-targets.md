@@ -10,9 +10,9 @@ only UEFI protocols, so the same entry file is built once per target in
 | UEFI arch | Zig target | How it is built | Tested |
 |---|---|---|---|
 | X64 | `x86_64-uefi-msvc` | Zig's own COFF linker | boots Linux under OVMF |
-| AA64 | `aarch64-uefi-msvc` | Zig's own COFF linker | runs under AAVMF (edk2); Linux boot test needs an arm64 kernel |
+| AA64 | `aarch64-uefi-msvc` | Zig's own COFF linker | boots Debian's arm64 6.1 kernel with a 2-file initramfs under AAVMF (edk2) on QEMU |
 | ARM | `thumb-uefi-msvc` | Zig's own COFF linker | builds, PE machine type checked; **not run** (no 32-bit ARM edk2 firmware on the dev machine) |
-| RISCV64 | `riscv64-uefi-msvc` (object) | **ELF + `tools/elf2efi.zig`** (see below) | runs under edk2 on QEMU `virt` |
+| RISCV64 | `riscv64-uefi-msvc` (object) | **ELF + `tools/elf2efi.zig`** (see below) | boots Debian's riscv64 6.12 kernel with a 2-file initramfs under edk2 on QEMU `virt` |
 
 ## 32-bit ARM needs `thumb`, not `arm`
 
@@ -56,9 +56,9 @@ It is what gnu-efi does with `objcopy -O pei-*`, in about 200 lines of Zig.
 When Zig can link riscv64 PE directly, delete the tool and make RISC-V another
 row in the `efi_targets` table in `build.zig`.
 
-Limits of what was verified: the result loads and runs under edk2 on QEMU
-`virt` (`tests/qemu/l12-riscv-arm.sh`). It has not been run on real hardware,
-nor has a RISC-V Linux kernel been booted through it.
+Limits of what was verified: the result loads, runs and boots a Linux kernel
+under edk2 on QEMU `virt` (`tests/qemu/l12-riscv-arm.sh`). It has not been run
+on real hardware.
 
 ## Other notes
 
@@ -67,3 +67,21 @@ nor has a RISC-V Linux kernel been booted through it.
   a unit test and by reading the image back with `mtools`.
 * `thumb-uefi` and `riscv64` binaries are 125 KB and 323 KB (limit 512 KiB).
   The RISC-V one is larger mostly because compiler-rt is bundled.
+
+## edk2 RISC-V `virt`: the device tree gets overwritten (not a Zig issue)
+
+Observed, not fully root-caused. On edk2's RISC-V `virt` firmware the device
+tree (the `EFI_DTB_TABLE_GUID` configuration table) was at `0x83ff8000`, intact
+when dklilo started, and zeroed by the time dklilo started the kernel; the
+kernel's EFI stub then printed `Invalid header detected on UEFI supplied FDT`
+and the boot hung. Booting the kernel straight from the firmware, with no
+loader in between, worked.
+
+A debugger watchpoint (QEMU gdbstub + lldb) showed the firmware's own stack
+pointer on both sides of that address, so the tree appears to sit inside the
+range the firmware stack grows through, and a loader that uses more than a few
+tens of KB of stack overwrites it. dklilo's fix is to copy the tree into
+allocated memory and re-publish it before doing anything else
+(`protectDeviceTree` in `src/uefi/main.zig`). This is worth reporting to edk2
+(the `RiscVVirt` platform); I have not reported it or confirmed the layout in
+the edk2 sources.

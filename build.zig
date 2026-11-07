@@ -244,16 +244,21 @@ pub fn build(b: *std.Build) void {
     });
     dev_step.dependOn(&b.addInstallArtifact(init, .{}).step);
 
-    // The same PID 1 for AArch64 kernels (installed as init-aa64).
-    const init_aa64 = b.addExecutable(.{
-        .name = "init-aa64",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/initramfs/init.zig"),
-            .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .none }),
-            .optimize = .ReleaseSmall,
-            .single_threaded = true,
-            .strip = true,
-        }),
-    });
-    dev_step.dependOn(&b.addInstallArtifact(init_aa64, .{}).step);
+    // The same PID 1 for the other architectures' kernels (init-aa64, init-riscv64).
+    for ([_]struct { arch: std.Target.Cpu.Arch, name: []const u8 }{
+        .{ .arch = .aarch64, .name = "init-aa64" },
+        .{ .arch = .riscv64, .name = "init-riscv64" },
+    }) |t| {
+        const exe = b.addExecutable(.{
+            .name = t.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/initramfs/init.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = t.arch, .os_tag = .linux, .abi = .none }),
+                .optimize = .ReleaseSmall,
+                .single_threaded = true,
+                .strip = true,
+            }),
+        });
+        dev_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
 }

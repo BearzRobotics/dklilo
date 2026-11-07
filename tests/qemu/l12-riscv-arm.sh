@@ -1,7 +1,8 @@
 #!/bin/sh
 # L12: the RISC-V 64 and 32-bit ARM UEFI loaders.
 #  * RISC-V runs under edk2 on QEMU "virt" (the loader is a PE file made by
-#    tools/elf2efi.zig, so this is the real test that it loads and runs).
+#    tools/elf2efi.zig, so this is the real test that it loads and runs) and,
+#    with a riscv64 Image (DKLILO_KERNEL_RISCV64), boots Linux.
 #  * 32-bit ARM has no firmware on most hosts (there is no AAVMF32 here), so
 #    only its build, PE machine type and installer file names are checked.
 # Skips (77) without qemu-system-riscv64 and the RISC-V firmware.
@@ -44,3 +45,24 @@ timeout 90 qemu-system-riscv64 -machine virt,acpi=off -m 1024 -display none -no-
 grep -qa "dklilo: no usable configuration" "$d/serial.txt" \
     && echo "PASS: RISC-V UEFI loader ran under edk2 and read the boot disk" \
     || { echo "FAIL; serial:"; strings "$d/serial.txt" | tail -5; exit 1; }
+
+# ---- Linux on RISC-V (needs a riscv64 Image with the EFI stub) ----------------
+cat > "$d/dklilo.conf" <<'C'
+timeout = 1
+default = test
+image  = /boot/vmlinuz
+    label  = test
+    root   = PARTUUID=4a6f8c21-0000-4000-8000-000000000002
+    append = "console=ttyS0 earlycon quiet dkl=yes"
+    initrd = /boot/initrd1.img
+    initrd = /boot/initrd2.cpio
+C
+rc=0; ARCH=riscv64 "$here/make-linux-disk.sh" "$d/disk.img" "$d/dklilo.conf" || rc=$?
+[ $rc -eq 77 ] && { echo "SKIP: no riscv64 kernel for the Linux boot (set DKLILO_KERNEL_RISCV64)"; exit 0; }
+[ $rc -eq 0 ] || exit $rc
+ARCH=riscv64 "$here/qemu-uefi.sh" "$d/disk.img" "$d/linux.txt" 240
+ok=1
+for want in "DKLILO-INITRAMFS-OK" "dkl=yes" "file /marker1: from-initrd-1" "file /marker2: from-initrd-2" "DKLILO-DONE"; do
+    grep -qaF -- "$want" "$d/linux.txt" || { echo "missing: $want"; ok=0; }
+done
+if [ $ok -eq 1 ]; then echo "PASS: RISC-V UEFI boot of Linux from ext4 with 2-file initramfs"; else echo "FAIL; serial tail:"; strings "$d/linux.txt" | tail -20; exit 1; fi

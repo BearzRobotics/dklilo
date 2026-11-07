@@ -152,6 +152,44 @@ fn pathPrefix(p: *const DevicePath) []const u8 {
     return bytes[0..total -| 4];
 }
 
+// ---- device tree ------------------------------------------------------------
+
+const device_tree_guid align(8) = Guid{
+    .time_low = 0xb1b621d5,
+    .time_mid = 0xf19c,
+    .time_high_and_version = 0x41a5,
+    .clock_seq_high_and_reserved = 0x83,
+    .clock_seq_low = 0x0b,
+    .node = .{ 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 },
+};
+
+/// Moves the firmware's device tree (the `EFI_DTB_TABLE_GUID` configuration
+/// table, present on ARM and RISC-V machines) into memory we allocate, and
+/// publishes the copy. On edk2's RISC-V "virt" platform the tree sits inside
+/// the range the firmware's own stack grows through, and dklilo's deeper call
+/// chains overwrite it, so the kernel's EFI stub then rejects it ("Invalid
+/// header detected on UEFI supplied FDT") and cannot boot. The copy is made
+/// first thing, before the stack is used deeply. Harmless where the tree is
+/// not at risk, and a no-op where there is none (x86).
+fn protectDeviceTree(bs: *uefi.tables.BootServices) void {
+    const st = uefi.system_table;
+    var i: usize = 0;
+    while (i < st.number_of_table_entries) : (i += 1) {
+        const t = st.configuration_table[i];
+        if (!std.meta.eql(t.vendor_guid, device_tree_guid)) continue;
+        const src: [*]const u8 = @ptrCast(t.vendor_table);
+        // flattened device tree header: magic 0xd00dfeed, then totalsize (both big-endian)
+        if (std.mem.readInt(u32, src[0..4], .big) != 0xd00dfeed) return;
+        const size = std.mem.readInt(u32, src[4..8], .big);
+        if (size < 40 or size > 4 << 20) return;
+        const pages = bs.allocatePages(.any, .boot_services_data, (size + 4095) / 4096) catch return;
+        const dst: [*]u8 = @ptrCast(pages.ptr);
+        @memcpy(dst[0..size], src[0..size]);
+        bs.installConfigurationTable(&device_tree_guid, @ptrCast(dst)) catch {};
+        return;
+    }
+}
+
 // ---- initrd via LoadFile2 --------------------------------------------------
 
 const LoadFile2 = extern struct {
@@ -342,6 +380,7 @@ fn chainEfi(target: []const u8) void {
 
 pub fn main() void {
     const bs = uefi.system_table.boot_services.?;
+    protectDeviceTree(bs);
     bs.setWatchdogTimer(0, 0, null) catch {};
     const con = UefiConsole.console();
 
