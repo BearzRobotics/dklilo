@@ -48,6 +48,7 @@ fi
 root_sectors=$((root_mb * 2048))
 
 rm -f "$out"
+rm -f "$out"   # a reused file would keep stale blocks where conv=sparse skips zeros
 truncate -s $((root_mb + 16))M "$out"
 if [ "$kind" = gpt ]; then
     sgdisk -o "$out" >/dev/null

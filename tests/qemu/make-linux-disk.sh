@@ -68,6 +68,7 @@ else
 fi
 root_sectors=$((root_mb * 2048))
 
+rm -f "$out"   # a reused file would keep stale blocks where conv=sparse skips zeros
 truncate -s $((root_mb + 40))M "$out"
 sfdisk -q "$out" >/dev/null <<S
 label: gpt
