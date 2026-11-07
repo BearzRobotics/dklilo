@@ -146,4 +146,4 @@ on the serial port at the same time.
 `dklilo`(1). `dklilo config` writes a first configuration, and `dklilo check` verifies a configuration with the same code the loader uses:
 every `image` and `initrd` must exist, labels must be unique.
 
-This page describes dklilo version 0.0.2.
+This page describes dklilo version 0.0.3.

@@ -1,6 +1,6 @@
 .{
     .name = .dklilo,
-    .version = "0.0.2",
+    .version = "0.0.3",
     .fingerprint = 0xeef64ac5c7d3f5b8,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{

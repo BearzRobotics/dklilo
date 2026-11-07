@@ -1,4 +1,4 @@
-% DKLILO(1) Version 0.0.2 | dklilo Manual
+% DKLILO(1) Version 0.0.3 | dklilo Manual
 % Dakota Keeler and contributors
 % 2026-11-06
 
@@ -260,4 +260,4 @@ Source code and issue tracker: <https://github.com/BearzRobotics/dklilo>
 
 # VERSION
 
-This manual describes dklilo version 0.0.2.
+This manual describes dklilo version 0.0.3.
