@@ -83,6 +83,14 @@ an ISO written to a stick).
 :   An initramfs. May be repeated; the files are concatenated in order, each
     padded to a 4-byte boundary, which the kernel unpacks as one.
 
+`iso = PATH`
+:   Boots from an ISO file stored on a filesystem instead of from the entry's
+    own: `image` and `initrd` are then paths inside the ISO. The ISO is read
+    in place, not copied into memory. The kernel command line gets
+    `iso-scan/filename=PATH` appended after `root=` and `append`, which the
+    initramfs of live distributions use to find the ISO. `PATH` may carry a
+    `LABEL=`, `UUID=` or `PARTUUID=` prefix (see PATHS). Linux entries only.
+
 `subvol = PATH`
 :   For btrfs: the subvolume that contains `image` and `initrd`, as a path
     under the top-level subvolume. Default: the filesystem's default subvolume.
@@ -135,5 +143,7 @@ on the serial port at the same time.
 
 ## SEE ALSO
 
-`dklilo check` verifies a configuration with the same code the loader uses:
+`dklilo`(1). `dklilo config` writes a first configuration, and `dklilo check` verifies a configuration with the same code the loader uses:
 every `image` and `initrd` must exist, labels must be unique.
+
+This page describes dklilo version 0.0.2.

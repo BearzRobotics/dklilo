@@ -65,7 +65,7 @@ other   = windows                # finds Windows automatically
   changing the kernel command line at boot.
 - Works over a **serial console** as well as the screen.
 - Boots the DKRescue **hybrid ISO** from DVD and USB on both firmware types.
-- Written in Zig 0.17.0, with no C and no separate assembler (see 3.1).
+- Written in Zig 0.17.1, with no C and no separate assembler (see 3.1).
 
 ### Non-goals (v1)
 
@@ -89,7 +89,7 @@ spec first.
 
 | Layer | Choice |
 |---|---|
-| Language | Zig **0.17.0**, pinned in `build.zig.zon` |
+| Language | Zig **0.17.1**, pinned in `build.zig.zon` |
 | BIOS stage 1 | 16-bit real-mode code as global `asm` blocks in `.zig` files |
 | BIOS stage 2 | Zig, `x86-freestanding`, 32-bit protected mode |
 | UEFI loader | Zig, `x86_64-uefi`, using `std.os.uefi` |
@@ -137,8 +137,8 @@ ordinary unit tests long before they run on bare metal.
 |---|---|
 | `blockdev` | One interface: read N sectors at LBA. Backed by BIOS `int 13h`, UEFI `BlockIo`, or a file under Linux. |
 | `part` | MBR (including extended partitions) and GPT parsing. |
-| `fs/ext4`, `fs/btrfs`, `fs/fat`, `fs/iso9660` | Read-only filesystem readers (5.4). |
-| `compress/lzo` | LZO decompression for btrfs. |
+| `devio` | Presents a `BlockDev` to the readers as a `std.Io` (see docs/std-io-freestanding.md). |
+| `fsread` (package in `deps/fsread`) | Read-only ext4, btrfs, FAT and ISO 9660 readers, `crc`, and LZO for btrfs; they read through `std.Io` (5.4). |
 | `config` | Parser for `dklilo.conf` (5.2). |
 | `menu` | The menu and command-line editor, drawn through a small console interface. |
 | `console` | Screen and serial output, keyboard and serial input, behind one interface. |
@@ -305,8 +305,8 @@ All readers are read-only and never write to the disk.
   `boot_params`) is declared as an `extern struct` with a comment linking to
   its specification, and a `comptime` assertion of its size.
 - `docs/boot-flow.md` walks through both boot paths from power-on to the
-  kernel, and `docs/dklilo.conf.5.md` is the configuration reference (and
-  the source of the man page).
+  kernel, and `docs/manpages/dklilo.conf.5.md` is the configuration reference and
+  `docs/manpages/dklilo.1.md` documents the `dklilo` command.
 
 ## 7. Repository layout
 
@@ -318,10 +318,14 @@ SPEC.md
 original/            LILO 24.2 and Slackware patches (reference only, not built)
 docs/
   boot-flow.md
-  dklilo.conf.5.md
+  std-io-freestanding.md
+  decisions/
+  manpages/        dklilo.1.md, dklilo.conf.5.md, template.md
+deps/
+  fsread/          filesystem readers, crc, lzo (a reusable package)
 src/
   common/
-    blockdev.zig  part/  fs/  compress/  config.zig  menu.zig  console.zig  linux/
+    blockdev.zig  devio.zig  part.zig  volumes.zig  config.zig  menu.zig  console.zig  linux/
   bios/
     stage1.zig        MBR code (.code16 asm)
     realmode.zig      real-mode trampoline and BIOS service wrappers

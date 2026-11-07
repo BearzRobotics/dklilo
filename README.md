@@ -54,7 +54,7 @@ software RAID, btrfs RAID0/5/6, NTFS/XFS readers, network boot, Multiboot,
 
 ## Building
 
-You need [Zig](https://ziglang.org/) **0.17.0**.
+You need [Zig](https://ziglang.org/) **0.17.1**.
 
 ```sh
 zig build            # everything: stage1/stage2, dkliloX64.efi, the dklilo tool
@@ -107,7 +107,7 @@ The syntax follows LILO: `key = value`, `#` for comments, and `image` or
 A path without a prefix refers to the filesystem the config was read from.
 `LABEL=`, `UUID=` and `PARTUUID=` prefixes select another one, for example
 `LABEL=boot:/vmlinuz`. The full reference is in
-[docs/dklilo.conf.5.md](docs/dklilo.conf.5.md).
+[docs/manpages/dklilo.conf.5.md](docs/manpages/dklilo.conf.5.md); the tool is documented in [docs/manpages/dklilo.1.md](docs/manpages/dklilo.1.md).
 
 ## Building a hybrid BIOS + UEFI ISO
 
@@ -151,7 +151,10 @@ chainloading is tested against a stub, and by hand against a real Windows VM.
   implementation notes.
 - [docs/boot-flow.md](docs/boot-flow.md): both boot paths from power-on to the
   kernel.
-- [docs/dklilo.conf.5.md](docs/dklilo.conf.5.md): configuration reference.
+- [docs/manpages/dklilo.conf.5.md](docs/manpages/dklilo.conf.5.md): configuration reference.
+- [docs/manpages/dklilo.1.md](docs/manpages/dklilo.1.md): the `dklilo` command.
+- [docs/std-io-freestanding.md](docs/std-io-freestanding.md): limits of `std.Io` on freestanding targets.
+- [deps/fsread](deps/fsread): the filesystem readers, reusable as a package.
 - `original/`: LILO 24.2 and Slackware patches, kept as reference material
   only. dklilo is a new implementation and shares no code with it.
 
