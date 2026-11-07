@@ -165,6 +165,15 @@ implemented (see SPEC.md section 9). Each release is meant to be booted on at
 least one BIOS-only and one UEFI machine before it is tagged. dklilo isn't
 signed, so Secure Boot must be off.
 
+## AI-assisted development
+
+Much of dklilo is written with the help of AI coding assistants (Claude Code),
+directed and reviewed by the maintainer. The rules that govern that work are
+in [ai/AGENTS.md](ai/AGENTS.md): code must be understandable without the AI
+that wrote it, claims must cite primary sources, and significant design
+changes are explained before they are made. Contributors who use AI tools are
+expected to follow the same rules, and to say so in their pull requests.
+
 ## License
 
 [MIT](LICENSE)
