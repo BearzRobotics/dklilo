@@ -63,7 +63,7 @@ fn isZero(b: []const u8) bool {
 }
 
 /// Plans `install-bios`. `head` is the start of the disk (at least up to the
-/// first partition, 1 MiB is plenty); `stage1`/`stage2` are the images to
+/// first partition and, on GPT, through the BIOS boot partition; 4 MiB is plenty); `stage1`/`stage2` are the images to
 /// install. `stage2_buf` receives the sector-padded stage 2 and must outlive
 /// the plan.
 pub fn planBios(

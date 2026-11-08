@@ -132,8 +132,10 @@ fn installBios(args: []const [:0]const u8) !u8 {
     };
     defer dev.close();
 
-    // The plan needs the start of the disk: the MBR, GPT and the gap.
-    const head_len: usize = @intCast(@min(dev.size, 1024 * 1024));
+    // The plan needs the start of the disk: the MBR, GPT, the gap and the BIOS
+    // boot partition. Tools align the first partition to 1 MiB, so a BIOS boot
+    // partition normally spans 1-2 MiB; 4 MiB leaves room for other layouts.
+    const head_len: usize = @intCast(@min(dev.size, 4 * 1024 * 1024));
     const head = try gpa_global.alloc(u8, head_len);
     defer gpa_global.free(head);
     try dev.readAt(0, head);
