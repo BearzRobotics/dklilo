@@ -194,8 +194,20 @@ fn mountinfoPath() []const u8 {
     return mountinfo_override orelse "/proc/self/mountinfo";
 }
 
+/// Reads a whole file by streaming until EOF. `readFileAlloc` trusts the size
+/// from stat, which is 0 for files in /proc, so it returns nothing for them.
+fn readStreamed(path: []const u8) ![]u8 {
+    var file = try Io.Dir.cwd().openFile(io_global, path, .{});
+    defer file.close(io_global);
+    var fr = file.readerStreaming(io_global, &.{});
+    return fr.interface.allocRemaining(gpa_global, .limited(1 << 20)) catch |e| switch (e) {
+        error.ReadFailed => return fr.err.?,
+        error.OutOfMemory, error.StreamTooLong => |x| return x,
+    };
+}
+
 fn mountSource(dir: []const u8, buf: []u8) ?[]const u8 {
-    const text = Io.Dir.cwd().readFileAlloc(io_global, mountinfoPath(), gpa_global, .limited(1 << 20)) catch return null;
+    const text = readStreamed(mountinfoPath()) catch return null;
     defer gpa_global.free(text);
     var best_len: usize = 0;
     var found: ?[]const u8 = null;
@@ -225,7 +237,7 @@ fn mountSource(dir: []const u8, buf: []u8) ?[]const u8 {
 /// (from the `subvol=` mount option, without a leading slash), or null if it
 /// is not btrfs or is the top-level subvolume.
 fn mountSubvol(dir: []const u8, buf: []u8) ?[]const u8 {
-    const text = Io.Dir.cwd().readFileAlloc(io_global, mountinfoPath(), gpa_global, .limited(1 << 20)) catch return null;
+    const text = readStreamed(mountinfoPath()) catch return null;
     defer gpa_global.free(text);
     var best_len: usize = 0;
     var found: ?[]const u8 = null;
