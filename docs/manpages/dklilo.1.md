@@ -1,7 +1,3 @@
-% DKLILO(1) Version 0.0.3 | dklilo Manual
-% Dakota Keeler and contributors
-% 2026-11-06
-
 # NAME
 
 dklilo - install and check the dklilo boot loader
@@ -23,16 +19,23 @@ dklilo - install and check the dklilo boot loader
 # DESCRIPTION
 
 dklilo is a boot loader with LILO's configuration syntax that reads the
+
 filesystems itself at boot time (ext2/3/4, btrfs, FAT, ISO 9660). The
+
 **dklilo** command is its installer and helper tool. It is one static
+
 executable that contains the BIOS and UEFI boot images.
 
 The boot loader reads its configuration, **dklilo.conf**(5), when the machine
+
 boots. Changing the configuration, or adding and removing kernels, needs no
+
 reinstall. The commands below are needed only to install the loader, to
+
 generate and check a configuration, and to build bootable ISO images.
 
 Every command that writes to a disk or to the EFI System Partition lists the
+
 writes first and asks for confirmation (see **--yes**).
 
 # COMMANDS
@@ -137,7 +140,9 @@ writes first and asks for confirmation (see **--yes**).
 :   (**config**) Do not add a Windows entry even if one is detected.
 
 Options are matched by exact spelling; the `--option=value` form is not
+
 supported. Disks may be given as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX` or any
+
 `/dev/disk/by-*` path.
 
 # EXIT STATUS
@@ -218,26 +223,39 @@ Build a hybrid BIOS and UEFI ISO (kernel and `dklilo.conf` go in `tree/`):
 # SECURITY CONSIDERATIONS
 
 The installer writes raw disk sectors and needs privileges that allow it.
+
 It writes only the locations it lists beforehand, and refuses to overwrite
+
 unrecognised data in the stage 2 area. The boot menu password in
+
 `dklilo.conf` is stored as a SHA-256 hash; it protects editing the kernel
+
 command line in the menu only, not the files on disk. dklilo does not support
+
 Secure Boot.
 
 # COMPATIBILITY
 
 Linux host for the tool. It is built for x86_64 by default, and for another
+
 architecture with `zig build -Dtarget=aarch64-linux-none`. The loader boots
+
 Linux and chainloads Windows on BIOS (MBR or GPT, x86 only) and on UEFI
+
 (x86_64, AArch64, 32-bit ARM and RISC-V 64). x86_64, AArch64 and
+
 RISC-V 64 are tested by booting Linux under QEMU with edk2 firmware; 32-bit
+
 ARM is only built and its file names checked. None of the non-x86 loaders has
+
 been run on real hardware. Built with Zig 0.17.1.
 
 # LIMITATIONS
 
 See the non-goals in the project's README and SPEC.md: no Secure Boot, no
+
 encrypted or LVM/RAID `/boot`, no btrfs RAID0/5/6, no NTFS or XFS readers, no
+
 network boot, no 32-bit kernels. BIOS support is x86 only; UEFI is x86_64, AArch64, 32-bit ARM and RISC-V 64, with the testing limits above.
 
 # SEE ALSO
@@ -261,3 +279,4 @@ Source code and issue tracker: <https://github.com/BearzRobotics/dklilo>
 # VERSION
 
 This manual describes dklilo version 0.0.3.
+
