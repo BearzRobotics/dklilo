@@ -1,6 +1,21 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // Manual pages (Markdown, read by dkman and dkde-help): share/man/manN/NAME.N.md.
+    // The section N is the number in the file name.
+    if (b.option(bool, "man", "Install the manual pages (default: on)") orelse true) {
+        const pages = [_][]const u8{ "dklilo.1.md", "dklilo.conf.5.md" };
+        for (pages) |page| {
+            const stem = page[0 .. page.len - ".md".len];
+            const section = stem[std.mem.lastIndexOfScalar(u8, stem, '.').? + 1 ..];
+            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                b.path(b.fmt("docs/manpages/{s}", .{page})),
+                .{ .custom = b.fmt("share/man/man{s}", .{section}) },
+                page,
+            ).step);
+        }
+    }
+
     // `zig build` installs only bin/dklilo (it embeds every boot image).
     // `zig build dev` also installs the loose images and the test fixtures
     // that tests/qemu/*.sh expect under zig-out/.
