@@ -21,7 +21,11 @@ comptime {
 //   0x0100000  kernel (protected-mode part)
 //   0x1E00000  stack (grows down from 0x1F00000)
 //   0x2000000  heap, 8 MiB
+// `stage2_early` checks that the stack and heap are RAM, and `bootLinux` that
+// the kernel stays below the stack and fits in RAM.
 const kernel_addr: u32 = 0x100000;
+const stack_floor: u32 = 0x1E00000;
+const stack_top: u32 = 0x1F00000;
 const heap_addr: usize = 0x2000000;
 const heap_size: usize = 8 * 1024 * 1024;
 const initrd_floor: u64 = heap_addr + heap_size;
@@ -127,6 +131,12 @@ fn bootLinux(
         return error.BadKernel;
     };
 
+    // Loading a bigger kernel would overwrite this loader as it runs.
+    const max_pm_size = stack_floor - kernel_addr;
+    if (kernel.pm_size > max_pm_size) {
+        say("\r\nkernel too large: {d} bytes (the limit is {d})", .{ kernel.pm_size, max_pm_size });
+        return error.BadKernel;
+    }
     const e820 = readE820();
 
     // Where the initramfs goes: size first, then as high as allowed.
@@ -135,13 +145,26 @@ fn bootLinux(
     if (initrd_specs.len > initrds.len) return error.NotFound;
     for (initrd_specs, 0..) |spec, i| {
         initrds[i] = try open(set, default, spec, subvol);
+        // Under 4 GiB each, so the sum of eight can't overflow.
+        if (initrds[i].file.size > std.math.maxInt(u32)) {
+            say("\r\nnot enough memory for the initramfs", .{});
+            return error.NoMemory;
+        }
         total += std.mem.alignForward(u64, initrds[i].file.size, 4);
     }
     // A relocatable kernel moves itself to at least 16 MiB (aligned up) and
     // needs init_size bytes there to decompress, so keep the initramfs above that.
     const align_to: u64 = @max(kernel.header.kernel_alignment, 0x1000);
     const run_at = std.mem.alignForward(u64, @max(@as(u64, kernel_addr), 0x1000000), align_to);
-    const kernel_end: u64 = @max(kernel_addr + @as(u64, kernel.pm_size), run_at + kernel.header.init_size);
+    const load_end = kernel_addr + @as(u64, kernel.pm_size);
+    const kernel_end: u64 = @max(load_end, run_at + kernel.header.init_size);
+    // Without a memory map (a very old BIOS) there is nothing to check against.
+    if (e820.len > 0 and !(bp.rangeUsable(e820, kernel_addr, load_end) and
+        bp.rangeUsable(e820, run_at, run_at + kernel.header.init_size)))
+    {
+        say("\r\nnot enough memory for the kernel", .{});
+        return error.NoMemory;
+    }
     var initrd_at: u64 = 0;
     if (total > 0) {
         initrd_at = bp.placeInitrd(e820, kernel.header.initrd_addr_max, total, @max(kernel_end, initrd_floor)) orelse {
@@ -245,9 +268,23 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
     }
 }
 
-export fn stage2_main() callconv(.c) noreturn {
+/// Runs first, on a small stack in low memory: the real stack and the heap are
+/// at fixed addresses that a machine with little RAM doesn't have.
+export fn stage2_early() callconv(.c) void {
     clearBss();
     con.init();
+    const e820 = readE820();
+    if (e820.len == 0) return;
+    if (bp.rangeUsable(e820, stack_floor, stack_top) and
+        bp.rangeUsable(e820, heap_addr, heap_addr + heap_size)) return;
+    con.clear();
+    say("dklilo: not enough memory (RAM is needed from {d} to {d} MiB)\r\n", .{
+        stack_floor >> 20, (heap_addr + heap_size) >> 20,
+    });
+    halt();
+}
+
+export fn stage2_main() callconv(.c) noreturn {
     const c = con.console();
 
     var fba = std.heap.FixedBufferAllocator.init(@as([*]u8, @ptrFromInt(heap_addr))[0..heap_size]);

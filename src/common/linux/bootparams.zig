@@ -88,6 +88,8 @@ pub const Error = error{
     NotLinux,
     /// Boot protocol older than 2.10, or not loadable high.
     TooOld,
+    /// More than 4 GiB of protected-mode kernel.
+    TooLarge,
 };
 
 /// What a loader needs to know about a kernel image.
@@ -109,7 +111,8 @@ pub fn parseKernel(image_start: []const u8, file_size: u64) Error!Kernel {
     const sects: u32 = if (hdr.setup_sects == 0) 4 else hdr.setup_sects;
     const setup_size = (sects + 1) * 512;
     if (file_size <= setup_size) return error.NotLinux;
-    return .{ .header = hdr, .setup_size = setup_size, .pm_size = @intCast(file_size - setup_size) };
+    const pm_size = std.math.cast(u32, file_size - setup_size) orelse return error.TooLarge;
+    return .{ .header = hdr, .setup_size = setup_size, .pm_size = pm_size };
 }
 
 /// Fills in a zeroed `boot_params` page: the kernel's own setup header with
@@ -150,6 +153,26 @@ pub fn setVgaText(page: *[boot_params_size]u8, cursor_row: u8, cursor_col: u8) v
     page[0x10] = 16; // orig_video_points
 }
 
+/// Whether every byte of `start..end` is usable RAM according to the map:
+/// covered by usable entries (possibly several, side by side) and touched by
+/// no entry of any other kind.
+pub fn rangeUsable(e820: []const E820Entry, start: u64, end: u64) bool {
+    for (e820) |e| {
+        if (e.kind != E820Entry.usable and e.size != 0 and e.addr < end and e.addr +| e.size > start)
+            return false;
+    }
+    var at = start;
+    while (at < end) {
+        var next = at;
+        for (e820) |e| {
+            if (e.kind == E820Entry.usable and e.addr <= at) next = @max(next, e.addr +| e.size);
+        }
+        if (next == at) return false; // a gap
+        at = next;
+    }
+    return true;
+}
+
 /// Chooses where to put the initramfs: as high as `initrd_addr_max` and the
 /// usable RAM allow, page aligned, and not below `floor` (the end of the
 /// area the kernel will occupy). Returns null if it doesn't fit.
@@ -188,6 +211,32 @@ test "initrd goes as high as allowed, page aligned, in usable RAM" {
     try std.testing.expect(q + (1 << 20) <= 0x10000000);
     // Doesn't fit above the floor.
     try std.testing.expect(placeInitrd(&map, 0x7FFFFFFF, 1 << 20, 0x7EF80000) == null);
+}
+
+test "a range is usable only if usable RAM covers all of it" {
+    const map = [_]E820Entry{
+        .{ .addr = 0x100000, .size = 0x300000, .kind = 1 },
+        .{ .addr = 0x400000, .size = 0x400000, .kind = 1 }, // adjoins the first
+        .{ .addr = 0x900000, .size = 0x100000, .kind = 1 }, // after a gap
+        .{ .addr = 0x980000, .size = 0x1000, .kind = 2 }, // reserved, inside it
+    };
+    try std.testing.expect(rangeUsable(&map, 0x100000, 0x800000));
+    try std.testing.expect(rangeUsable(&map, 0x200000, 0x200000)); // empty
+    try std.testing.expect(!rangeUsable(&map, 0xFF000, 0x200000)); // starts early
+    try std.testing.expect(!rangeUsable(&map, 0x700000, 0x800001)); // into the gap
+    try std.testing.expect(!rangeUsable(&map, 0x700000, 0x910000)); // across it
+    try std.testing.expect(rangeUsable(&map, 0x900000, 0x980000));
+    try std.testing.expect(!rangeUsable(&map, 0x900000, 0x980001)); // reserved
+    try std.testing.expect(!rangeUsable(&.{}, 0x100000, 0x100001));
+}
+
+test "parseKernel rejects a kernel of 4 GiB or more" {
+    var buf = std.mem.zeroes([0x300]u8);
+    std.mem.writeInt(u32, buf[0x202..][0..4], 0x53726448, .little);
+    std.mem.writeInt(u16, buf[0x1FE..][0..2], 0xAA55, .little);
+    std.mem.writeInt(u16, buf[0x206..][0..2], 0x020F, .little);
+    buf[0x211] = 1;
+    try std.testing.expectError(error.TooLarge, parseKernel(&buf, (1 << 32) + 5 * 512));
 }
 
 test "parseKernel rejects non-kernels and old protocols" {

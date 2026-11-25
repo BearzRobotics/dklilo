@@ -29,7 +29,9 @@ command proves a configuration with the code that will boot it.
    `dl` still holding the drive.
 3. **Stage 2's first code** (`realmode.zig`) enables A20 through port `0x92`,
    loads a flat GDT and sets `CR0.PE`. From here the CPU runs flat 32-bit
-   code and Zig takes over (`stage2_main`).
+   code and Zig takes over. `stage2_early` runs first, on a temporary stack
+   below `0x7C00`: it checks the E820 map for RAM where the stack and heap go,
+   and stops with "not enough memory" if there is none. Then `stage2_main`.
 4. **BIOS services** are still needed for the disk, keyboard and screen. The
    trampoline `bios_int(vec)` drops to real mode (via a 16-bit protected-mode
    segment, so the segment limits are right), runs `int vec` with registers
@@ -92,8 +94,11 @@ same stage 2 copy inside the ISO.
 ## Memory map (BIOS)
 
 ```
-0x00500-0x06EFF  real-mode stack
+0x00500-0x06BFF  real-mode stack (grows down from 0x6C00)
+0x06C00          scratch buffer for BIOS results
+0x06E00          disk address packet
 0x06F00          register block for BIOS calls
+(0x07C00)        temporary 32-bit stack until the memory check has passed
 0x08000-0x87FFF  stage 2 (at most 512 KiB)
 0x88000-0x8FFFF  32 KiB disk bounce buffer
 0x90000          boot_params, 0x91000 kernel command line

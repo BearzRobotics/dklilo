@@ -11,10 +11,12 @@
 //! far control transfers; `retf` assembles as the 32-bit `retfd`.
 //!
 //! Low memory map (also in SPEC.md):
-//!   0x00500-0x06EFF  real-mode stack (grows down from 0x6F00)
+//!   0x00500-0x06BFF  real-mode stack (grows down from 0x6C00, so that the BIOS
+//!                    can't reach anything below as it uses it)
 //!   0x06C00          scratch: E820 / drive-parameter results
 //!   0x06E00          disk address packet
 //!   0x06F00          Regs block
+//!   (0x07C00)        temporary 32-bit stack until `stage2_early` returns
 //!   0x08000-0x87FFF  stage 2 image
 //!   0x88000-0x8FFFF  32 KiB disk bounce buffer
 //!   0x90000          boot_params, 0x91000 kernel command line
@@ -118,6 +120,8 @@ comptime {
         \\   mov fs, ax
         \\   mov gs, ax
         \\   mov ss, ax
+        \\   mov esp, 0x7C00        # a temporary stack in low memory, until it
+        \\   call stage2_early      # is known that RAM exists higher up
         \\   mov esp, 0x1F00000     # stack: just below the 32 MiB heap
         \\   call stage2_main
         \\ 1:
@@ -158,7 +162,7 @@ comptime {
         \\   mov fs, ax
         \\   mov gs, ax
         \\   mov ss, ax
-        \\   mov sp, 0x6F00         # real-mode stack below the Regs block
+        \\   mov sp, 0x6C00         # real-mode stack, below the scratch buffer
         \\   lidt [rm_idtr]         # the BIOS interrupt vector table at 0
         \\   mov eax, [0x6F00]
         \\   mov ebx, [0x6F04]
@@ -171,9 +175,10 @@ comptime {
         \\ int_op:
         \\   .byte 0xCD, 0x00       # int imm8; the immediate is patched above
         \\   cli
-        \\   push eax               # re-establish ds = es = 0 in case the BIOS
-        \\   xor ax, ax             # changed them
-        \\   mov ds, ax
+        \\   pushfd                 # save the BIOS call's flags now: the xor
+        \\   push eax               # below overwrites CF (error) and ZF. Then
+        \\   xor ax, ax             # re-establish ds = es = 0 in case the BIOS
+        \\   mov ds, ax             # changed them
         \\   mov es, ax
         \\   pop eax
         \\   mov [0x6F00], eax
@@ -183,8 +188,7 @@ comptime {
         \\   mov [0x6F10], esi
         \\   mov [0x6F14], edi
         \\   mov [0x6F18], ebp
-        \\   pushfd
-        \\   pop eax
+        \\   pop eax                # the flags pushed above
         \\   mov [0x6F1C], eax      # flags after the call (carry = error)
         \\   lgdt [gdtr]
         \\   mov eax, cr0

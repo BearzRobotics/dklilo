@@ -417,13 +417,21 @@ Each milestone is merged only when all its acceptance criteria pass.
 
 Details settled while building L0-L3 that the sections above leave open.
 
-- **BIOS memory map.** Low memory: real-mode stack below `0x6F00`, the BIOS
+- **BIOS memory map.** Low memory: real-mode stack below `0x6C00`, a scratch
+  buffer for BIOS results at `0x6C00`, the disk address packet at `0x6E00`
+  (nothing the BIOS reads or writes lies below its stack pointer), the BIOS
   call register block at `0x6F00`, stage 2 at `0x8000-0x87FFF`, a 32 KiB disk
   bounce buffer at `0x88000`, `boot_params` at `0x90000`, the kernel command
   line at `0x91000`. Above 1 MiB: kernel at `0x100000`, stack just below
   `0x1F00000`, an 8 MiB heap at `0x2000000`. The initramfs goes as high as the
   E820 map and `initrd_addr_max` allow, never below the end of the heap.
-  Machines need roughly 40 MiB of RAM or more.
+  Machines need roughly 41 MiB of RAM or more.
+- **BIOS memory checks.** Before using the stack and heap, stage 2 checks that
+  the E820 map says they are usable RAM, and otherwise stops with a message.
+  It refuses a kernel whose protected-mode part is over 29 MiB (loading it
+  would reach the stack), and one whose load area, or the `init_size` bytes it
+  needs to unpack itself, are not usable RAM. A BIOS that returns no E820 map
+  gets neither RAM check.
 - **BIOS file loading** reads kernel and initramfs straight to their final
   addresses; nothing buffers a whole file.
 - **Block list.** Stage 1 holds one extent (u64 LBA, u16 sector count) at MBR
