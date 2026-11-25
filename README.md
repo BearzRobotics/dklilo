@@ -73,7 +73,9 @@ binary (static, no libc).
 ## Installing
 
 Every command lists its writes first and needs `--yes` or an interactive
-confirmation.
+confirmation. `install-bios` takes a whole disk and refuses targets that don't
+look like one. `install-uefi --removable` replaces another system's loader
+only with `--force`; see [the manual](docs/manpages/dklilo.1.md).
 
 ```sh
 # Generate a first config from /boot, the root PARTUUID and Windows detection

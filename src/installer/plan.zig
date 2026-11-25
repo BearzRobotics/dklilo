@@ -11,6 +11,8 @@ pub const mbr_code_size = 440;
 pub const blocklist_offset = 416;
 /// Magic at offset 2 of an installed stage 2 (after a 2-byte jump).
 pub const stage2_magic = "DKLILOS2";
+/// The longest stage 2 there can be (SPEC 5.1: 512 KiB).
+pub const max_stage2_sectors = 1024;
 
 pub const Error = error{
     /// The disk has no recognisable MBR (no 0x55AA signature).
@@ -21,6 +23,16 @@ pub const Error = error{
     NoBiosBootPartition,
     /// The space for stage 2 holds data that is not zeros or an older dklilo.
     ForeignData,
+    /// An older stage 2 is there, but the MBR no longer records its length, so
+    /// what follows it can't be told apart from its own tail.
+    UnrecordedStage2,
+    /// The first sector is a filesystem's boot sector, not a partition table
+    /// (the target is probably a partition rather than a disk).
+    FilesystemBootSector,
+    /// An MBR entry no partitioning tool would write.
+    BadPartitionTable,
+    /// An MBR with no partitions: nothing there could be booted.
+    NoPartitions,
     /// A stage 1/2 image that does not look like ours.
     BadImage,
 };
@@ -40,7 +52,8 @@ pub const BiosPlan = struct {
     mbr: [sector_size]u8,
     /// True if the old MBR held boot code that will be replaced.
     replaces_boot_code: bool,
-    /// Stage 2 padded to whole sectors (lives in the caller's buffer).
+    /// What is written at `stage2_lba` (lives in the caller's buffer): stage 2
+    /// padded to whole sectors, then zeros over the rest of a longer older one.
     stage2_padded: []const u8,
 
     /// The writes to perform, in order. The slices point into `self`, so the
@@ -62,28 +75,64 @@ fn isZero(b: []const u8) bool {
     return std.mem.allEqual(u8, b, 0);
 }
 
+/// The name of the filesystem whose boot sector `sector` is, or null. These
+/// end in 0x55AA like an MBR, and writing boot code over one destroys it.
+fn filesystemBootSector(sector: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, sector[3..11], "NTFS    ")) return "NTFS";
+    if (std.mem.eql(u8, sector[3..11], "EXFAT   ")) return "exFAT";
+    // FAT: a jump, a sector size, and the type string that formatting tools
+    // put in the extended BIOS parameter block (offset 54, or 82 for FAT32).
+    // MBR boot code does not have all of these.
+    const bytes_per_sector = std.mem.readInt(u16, sector[11..13], .little);
+    if ((sector[0] == 0xEB or sector[0] == 0xE9) and
+        bytes_per_sector >= 512 and bytes_per_sector <= 4096 and std.math.isPowerOfTwo(bytes_per_sector))
+    {
+        for ([_][]const u8{ "FAT12   ", "FAT16   ", "FAT     " }) |kind| {
+            if (std.mem.eql(u8, sector[54..62], kind)) return "FAT";
+        }
+        if (std.mem.eql(u8, sector[82..90], "FAT32   ")) return "FAT";
+    }
+    return null;
+}
+
+/// The length in sectors of the stage 2 the current MBR loads from `lba`, if
+/// the MBR holds our stage 1 and a believable block list.
+fn recordedStage2(mbr: []const u8, lba: u64) ?u32 {
+    if (!looksLikeStage1(mbr[0..mbr_code_size])) return null;
+    if (std.mem.readInt(u64, mbr[blocklist_offset..][0..8], .little) != lba) return null;
+    const count = std.mem.readInt(u16, mbr[blocklist_offset + 8 ..][0..2], .little);
+    if (count == 0 or count > max_stage2_sectors) return null;
+    return count;
+}
+
 /// Plans `install-bios`. `head` is the start of the disk (at least up to the
 /// first partition and, on GPT, through the BIOS boot partition; 4 MiB is plenty); `stage1`/`stage2` are the images to
-/// install. `stage2_buf` receives the sector-padded stage 2 and must outlive
-/// the plan.
+/// install. `stage2_buf` receives what goes where stage 2 lives (at most
+/// `max_stage2_sectors`) and must outlive the plan. `force` allows replacing
+/// an older stage 2 whose length is no longer recorded; it never allows
+/// writing over anything that is not dklilo's.
 pub fn planBios(
     head: []const u8,
     stage1: []const u8,
     stage2: []const u8,
     stage2_buf: []u8,
-    allocator: std.mem.Allocator,
+    force: bool,
 ) Error!BiosPlan {
-    _ = allocator;
     if (head.len < sector_size * 2 or head[510] != 0x55 or head[511] != 0xAA) return error.NoPartitionTable;
     if (stage1.len < mbr_code_size or !std.mem.eql(u8, stage2[2..10], stage2_magic)) return error.BadImage;
 
     const sectors: u32 = @intCast((stage2.len + sector_size - 1) / sector_size);
-    if (stage2_buf.len < sectors * sector_size) return error.NoRoom;
-    @memset(stage2_buf[0 .. sectors * sector_size], 0);
-    @memcpy(stage2_buf[0..stage2.len], stage2);
+    if (sectors > max_stage2_sectors) return error.NoRoom;
+    if (filesystemBootSector(head[0..sector_size]) != null) return error.FilesystemBootSector;
 
     var disk = common.blockdev.MemDisk{ .data = head };
     const table = common.part.read(disk.blockDev()) catch return error.NoPartitionTable;
+    // The status byte of each of the four entries: inactive or active.
+    for (0..4) |i| {
+        const status = head[446 + 16 * i];
+        if (status != 0 and status != 0x80) return error.BadPartitionTable;
+    }
+    if (table.kind == .mbr and table.count == 0) return error.NoPartitions;
 
     var lba: u64 = 1;
     var room: u64 = 0; // sectors available at `lba`
@@ -92,7 +141,6 @@ pub fn planBios(
             // The gap runs from LBA 1 to the first partition.
             var first: u64 = std.math.maxInt(u64);
             for (table.slice()) |p| first = @min(first, p.start_lba);
-            if (first == std.math.maxInt(u64)) first = head.len / sector_size;
             room = first -| 1;
         },
         .gpt => {
@@ -108,10 +156,29 @@ pub fn planBios(
     if (room < sectors) return error.NoRoom;
     if ((lba + sectors) * sector_size > head.len) return error.NoRoom;
 
-    // Only zeros or an older dklilo stage 2 may be overwritten.
+    // Only zeros or an older dklilo stage 2 may be overwritten. The older
+    // one's own sectors are those its block list records; past them, zeros.
     const target = head[lba * sector_size ..][0 .. sectors * sector_size];
-    const ours = std.mem.eql(u8, target[2..10], stage2_magic);
-    if (!ours and !isZero(target)) return error.ForeignData;
+    var older: u32 = 0; // sectors known to hold an older stage 2
+    var unrecorded = false;
+    if (std.mem.eql(u8, target[2..10], stage2_magic)) {
+        if (recordedStage2(head[0..sector_size], lba)) |n| {
+            // A record reaching past the space or the buffer is not believed.
+            if (n <= room and (lba + n) * sector_size <= head.len) older = n else unrecorded = true;
+        } else unrecorded = true;
+    }
+    if (unrecorded) {
+        if (!force) return error.UnrecordedStage2;
+    } else if (older < sectors and !isZero(target[older * sector_size ..])) {
+        return error.ForeignData;
+    }
+
+    // A longer older stage 2 is cleared completely, so a later install does
+    // not meet its leftovers and take them for someone else's data.
+    const written = @max(sectors, older);
+    if (stage2_buf.len < written * sector_size) return error.NoRoom;
+    @memset(stage2_buf[0 .. written * sector_size], 0);
+    @memcpy(stage2_buf[0..stage2.len], stage2);
 
     var mbr: [sector_size]u8 = undefined;
     @memcpy(&mbr, head[0..sector_size]);
@@ -126,13 +193,22 @@ pub fn planBios(
         .stage2_sectors = sectors,
         .mbr = mbr,
         .replaces_boot_code = replaces,
-        .stage2_padded = stage2_buf[0 .. sectors * sector_size],
+        .stage2_padded = stage2_buf[0 .. written * sector_size],
     };
 }
 
 /// Does this MBR code area start the way our stage 1 does (cli; xor ax,ax...)?
 fn looksLikeStage1(code: []const u8) bool {
     return code.len > 8 and std.mem.eql(u8, code[0..5], &[_]u8{ 0xFA, 0x31, 0xC0, 0x8E, 0xD8 });
+}
+
+// ---- the loader already on removable media ---------------------------------
+
+/// Is `image` a dklilo UEFI loader, of this version or another? Every build
+/// carries the menu's and the manual prompt's headings as plain text.
+pub fn isDkliloLoader(image: []const u8) bool {
+    return std.mem.indexOf(u8, image, common.menu.title) != null and
+        std.mem.indexOf(u8, image, common.menu.manual_title) != null;
 }
 
 // ---- UEFI boot entry -----------------------------------------------------
@@ -228,13 +304,21 @@ fn mbrDisk(first: u32) [1024 * 1024]u8 {
     return d;
 }
 
+/// Gives `disk` our stage 1 with a block list, as an earlier install did.
+fn record(disk: []u8, lba: u64, sectors: u16) void {
+    const s1 = fakeStage1();
+    @memcpy(disk[0..mbr_code_size], s1[0..mbr_code_size]);
+    std.mem.writeInt(u64, disk[blocklist_offset..][0..8], lba, .little);
+    std.mem.writeInt(u16, disk[blocklist_offset + 8 ..][0..2], sectors, .little);
+}
+
 test "mbr: stage 2 goes at LBA 1, the partition table survives" {
     var disk = mbrDisk(2048);
     var s2buf: [4096]u8 = undefined;
     var padded: [4096]u8 = undefined;
     const s2 = fakeStage2(1500, &s2buf);
     const s1 = fakeStage1();
-    const plan = try planBios(&disk, &s1, s2, &padded, testing.allocator);
+    const plan = try planBios(&disk, &s1, s2, &padded, false);
     try testing.expectEqual(@as(u64, 1), plan.stage2_lba);
     try testing.expectEqual(@as(u32, 3), plan.stage2_sectors);
     // Block list.
@@ -255,7 +339,7 @@ test "mbr: the gap too small for stage 2 is refused" {
     var padded: [4096]u8 = undefined;
     const s2 = fakeStage2(1500, &s2buf);
     const s1 = fakeStage1();
-    try testing.expectError(error.NoRoom, planBios(&disk, &s1, s2, &padded, testing.allocator));
+    try testing.expectError(error.NoRoom, planBios(&disk, &s1, s2, &padded, false));
 }
 
 test "foreign data in the gap is never overwritten; an older dklilo is" {
@@ -267,17 +351,18 @@ test "foreign data in the gap is never overwritten; an older dklilo is" {
 
     // Another boot loader's core image at LBA 1.
     @memcpy(disk[512..][0..16], "GRUB core image!");
-    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, testing.allocator));
+    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, false));
 
     // Foreign data in a *later* sector of the range is caught too.
     disk = mbrDisk(2048);
     disk[512 * 3 - 1] = 0x42;
-    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, testing.allocator));
+    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, false));
 
-    // An older dklilo stage 2 is replaced.
+    // An older dklilo stage 2, recorded in the block list, is replaced.
     disk = mbrDisk(2048);
     _ = fakeStage2(900, disk[512..]);
-    const plan = try planBios(&disk, &s1, s2, &padded, testing.allocator);
+    record(&disk, 1, 2);
+    const plan = try planBios(&disk, &s1, s2, &padded, false);
     try testing.expectEqual(@as(u64, 1), plan.stage2_lba);
 }
 
@@ -288,8 +373,76 @@ test "other boot code in the MBR is reported as replaced" {
     var padded: [4096]u8 = undefined;
     const s2 = fakeStage2(600, &s2buf);
     const s1 = fakeStage1();
-    const plan = try planBios(&disk, &s1, s2, &padded, testing.allocator);
+    const plan = try planBios(&disk, &s1, s2, &padded, false);
     try testing.expect(plan.replaces_boot_code);
+}
+
+test "an older stage 2 owns only the sectors its block list records" {
+    var s2buf: [4096]u8 = undefined;
+    var padded: [8192]u8 = undefined;
+    const s2 = fakeStage2(1500, &s2buf); // 3 sectors
+    const s1 = fakeStage1();
+
+    // Shorter before: what follows it must be zero.
+    var disk = mbrDisk(2048);
+    _ = fakeStage2(400, disk[512..]);
+    record(&disk, 1, 1);
+    disk[512 * 3] = 0x42; // in the third sector of the new range
+    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, false));
+    try testing.expectError(error.ForeignData, planBios(&disk, &s1, s2, &padded, true));
+
+    // Longer before: all of it is cleared.
+    disk = mbrDisk(2048);
+    _ = fakeStage2(5 * 512, disk[512..]);
+    record(&disk, 1, 5);
+    const plan = try planBios(&disk, &s1, s2, &padded, false);
+    try testing.expectEqual(@as(u32, 3), plan.stage2_sectors);
+    try testing.expectEqual(@as(usize, 5 * 512), plan.stage2_padded.len);
+    try testing.expect(isZero(plan.stage2_padded[3 * 512 ..]));
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, plan.mbr[424..426], .little));
+
+    // No record, or one for another place: only with force.
+    disk = mbrDisk(2048);
+    _ = fakeStage2(400, disk[512..]);
+    try testing.expectError(error.UnrecordedStage2, planBios(&disk, &s1, s2, &padded, false));
+    record(&disk, 64, 1);
+    try testing.expectError(error.UnrecordedStage2, planBios(&disk, &s1, s2, &padded, false));
+    _ = try planBios(&disk, &s1, s2, &padded, true);
+}
+
+test "things that are not a partitioned disk are refused" {
+    var s2buf: [4096]u8 = undefined;
+    var padded: [4096]u8 = undefined;
+    const s2 = fakeStage2(600, &s2buf);
+    const s1 = fakeStage1();
+
+    // Filesystem boot sectors, even with a believable partition entry.
+    for ([_]struct { at: usize, text: []const u8 }{
+        .{ .at = 3, .text = "NTFS    " },
+        .{ .at = 3, .text = "EXFAT   " },
+        .{ .at = 54, .text = "FAT16   " },
+        .{ .at = 82, .text = "FAT32   " },
+    }) |case| {
+        var disk = mbrDisk(2048);
+        disk[0] = 0xEB;
+        std.mem.writeInt(u16, disk[11..13], 512, .little);
+        @memcpy(disk[case.at..][0..case.text.len], case.text);
+        try testing.expectError(error.FilesystemBootSector, planBios(&disk, &s1, s2, &padded, true));
+    }
+
+    var disk = mbrDisk(2048);
+    disk[462] = 0x41;
+    try testing.expectError(error.BadPartitionTable, planBios(&disk, &s1, s2, &padded, true));
+
+    disk = mbrDisk(2048);
+    @memset(disk[446..510], 0);
+    try testing.expectError(error.NoPartitions, planBios(&disk, &s1, s2, &padded, true));
+}
+
+test "a dklilo loader is told apart from other loaders" {
+    try testing.expect(isDkliloLoader("MZ.." ++ common.menu.title ++ "\x00" ++ common.menu.manual_title));
+    try testing.expect(!isDkliloLoader("MZ.. GRUB " ++ common.menu.title));
+    try testing.expect(!isDkliloLoader(""));
 }
 
 test "a disk without an MBR signature is refused" {
@@ -299,7 +452,7 @@ test "a disk without an MBR signature is refused" {
     var padded: [4096]u8 = undefined;
     const s2 = fakeStage2(600, &s2buf);
     const s1 = fakeStage1();
-    try testing.expectError(error.NoPartitionTable, planBios(&disk, &s1, s2, &padded, testing.allocator));
+    try testing.expectError(error.NoPartitionTable, planBios(&disk, &s1, s2, &padded, false));
 }
 
 test "EFI_LOAD_OPTION layout" {

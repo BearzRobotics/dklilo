@@ -12,6 +12,12 @@ const console = @import("console.zig");
 const Console = console.Console;
 const Key = console.Key;
 
+/// The headings of the two screens. `dklilo install-uefi` also looks for
+/// them to recognise an installed loader, so changing one stops it from
+/// recognising loaders already installed.
+pub const title = "dklilo boot menu";
+pub const manual_title = "dklilo: no usable configuration";
+
 pub const Choice = struct {
     index: usize,
     /// Kernel command line (empty for chainload entries); lives in the
@@ -103,7 +109,7 @@ fn passwordOk(cfg: *const config.Config, typed: []const u8) bool {
 fn draw(con: Console, cfg: *const config.Config, sel: usize, remaining: ?u32) void {
     con.clear();
     con.moveTo(0, 0);
-    con.puts("dklilo boot menu");
+    con.puts(title);
     for (cfg.entries, 0..) |e, i| {
         con.moveTo(@intCast(2 + i), 2);
         con.setHighlight(i == sel);
@@ -208,7 +214,7 @@ fn edit(con: Console, cfg: *const config.Config, sel: usize, cmd_buf: []u8) ?[]c
 pub fn manualPrompt(con: Console, path_buf: []u8, cmd_buf: []u8) ?struct { path: []const u8, cmdline: []const u8 } {
     con.clear();
     con.moveTo(0, 0);
-    con.puts("dklilo: no usable configuration. Boot by hand.");
+    con.puts(manual_title ++ ". Boot by hand.");
     con.moveTo(2, 0);
     con.puts("Kernel path:  ");
     var plen: usize = 0;

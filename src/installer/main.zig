@@ -1,8 +1,8 @@
 //! `dklilo`: installs and checks the boot loader. Static, no libc.
 //!
 //!   dklilo check [conf] [--device DEV]
-//!   dklilo install-bios <disk> [--yes]
-//!   dklilo install-uefi <esp-dir> [--removable] [--entry-file F] [--device DEV] [--yes]
+//!   dklilo install-bios <disk> [--force] [--yes]
+//!   dklilo install-uefi <esp-dir> [--removable [--force]] [--entry-file F] [--device DEV] [--yes]
 //!   dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
 //!   dklilo mkiso-images <dir>
 //!   dklilo isohybrid <iso>
@@ -14,6 +14,8 @@ const common = @import("common");
 const plan = @import("plan.zig");
 const fat12 = @import("fat12.zig");
 const genconfig = @import("genconfig.zig");
+const bootvars = @import("bootvars.zig");
+const blockinfo = @import("blockinfo.zig");
 const arch_mod = @import("arch.zig");
 const Arch = arch_mod.Arch;
 
@@ -60,8 +62,8 @@ fn usage() u8 {
     err(
         \\usage:
         \\  dklilo check [conf] [--device DEV]
-        \\  dklilo install-bios <disk> [--yes]
-        \\  dklilo install-uefi <esp-dir> [--arch ARCH] [--removable] [--entry-file FILE] [--device DEV] [--yes]
+        \\  dklilo install-bios <disk> [--force] [--yes]
+        \\  dklilo install-uefi <esp-dir> [--arch ARCH] [--removable [--force]] [--entry-file FILE] [--device DEV] [--yes]
         \\  dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
         \\  dklilo mkiso-images <dir> [--arch ARCH]
         \\  dklilo isohybrid <iso>
@@ -116,15 +118,41 @@ fn confirm(yes: bool) bool {
     return std.mem.eql(u8, std.mem.trim(u8, line, " \r\t"), "yes");
 }
 
+/// Does `path` (symlinks followed) name a partition's block device? Anything
+/// that is not a block device, an image file for one, is not.
+fn namesPartition(path: [:0]const u8) !bool {
+    const linux = std.os.linux;
+    var st: linux.Statx = undefined;
+    // A path that cannot be examined is left to the open to report.
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .TYPE = true }, &st)) != .SUCCESS) return false;
+    if (st.mode & linux.S.IFMT != linux.S.IFBLK) return false;
+    var sys = try Io.Dir.cwd().openDir(io_global, "/sys/dev/block", .{});
+    defer sys.close(io_global);
+    return blockinfo.isPartition(io_global, sys, st.rdev_major, st.rdev_minor);
+}
+
 // ---- install-bios ----------------------------------------------------------
 
 fn installBios(args: []const [:0]const u8) !u8 {
-    var disk_path: ?[]const u8 = null;
+    var disk_path: ?[:0]const u8 = null;
     var yes = false;
+    var force = false;
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--yes")) yes = true else if (disk_path == null) disk_path = a else return usage();
+        if (std.mem.eql(u8, a, "--yes")) {
+            yes = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
+        } else if (disk_path == null) disk_path = a else return usage();
     }
     const path = disk_path orelse return usage();
+    const partition = namesPartition(path) catch |e| {
+        err("dklilo: cannot tell whether {s} is a disk or a partition: {s}\n", .{ path, @errorName(e) });
+        return 1;
+    };
+    if (partition) {
+        err("dklilo: {s} is a partition. install-bios takes the whole disk (for example /dev/sda, not /dev/sda1).\n", .{path});
+        return 1;
+    }
 
     var dev = Device.open(path, true) catch |e| {
         err("dklilo: cannot open {s}: {s}\n", .{ path, @errorName(e) });
@@ -140,15 +168,19 @@ fn installBios(args: []const [:0]const u8) !u8 {
     defer gpa_global.free(head);
     try dev.readAt(0, head);
 
-    const padded = try gpa_global.alloc(u8, stage2_image.len + 1024);
+    const padded = try gpa_global.alloc(u8, plan.max_stage2_sectors * plan.sector_size);
     defer gpa_global.free(padded);
-    const p = plan.planBios(head, stage1_image, stage2_image, padded, gpa_global) catch |e| {
+    const p = plan.planBios(head, stage1_image, stage2_image, padded, force) catch |e| {
         switch (e) {
             error.ForeignData => err("dklilo: the space for stage 2 holds data that is not zeros or an older dklilo.\n  Refusing to overwrite it (another boot loader may live there).\n", .{}),
             error.NoRoom => err("dklilo: not enough room before the first partition for stage 2 ({d} bytes).\n", .{stage2_image.len}),
             error.NoBiosBootPartition => err("dklilo: this GPT disk has no BIOS boot partition (type EF02) to hold stage 2.\n", .{}),
             error.NoPartitionTable => err("dklilo: {s} has no partition table (no 0x55AA MBR signature).\n", .{path}),
             error.BadImage => err("dklilo: internal error: bad embedded boot images.\n", .{}),
+            error.UnrecordedStage2 => err("dklilo: an older dklilo stage 2 is there, but the MBR no longer records its length,\n  so what follows it cannot be checked. If nothing else uses that space, repeat with --force.\n", .{}),
+            error.FilesystemBootSector => err("dklilo: {s} starts with a filesystem's boot sector, not a partition table. Refusing:\n  installing would destroy that filesystem. Give the whole disk.\n", .{path}),
+            error.BadPartitionTable => err("dklilo: {s} has no valid MBR partition table (bad status byte in an entry).\n", .{path}),
+            error.NoPartitions => err("dklilo: the partition table of {s} is empty.\n", .{path}),
         }
         return 1;
     };
@@ -157,6 +189,8 @@ fn installBios(args: []const [:0]const u8) !u8 {
     const writes = p.writes();
     for (writes) |w| out("  write {s}: offset {d}, {d} bytes\n", .{ w.what, w.offset, w.data.len });
     out("  stage 2 at LBA {d} ({d} sectors)\n", .{ p.stage2_lba, p.stage2_sectors });
+    const cleared = p.writes()[0].data.len / plan.sector_size - p.stage2_sectors;
+    if (cleared > 0) out("  note: the write also zeroes {d} more sectors left by a longer older stage 2\n", .{cleared});
     if (p.replaces_boot_code) out("  note: the existing MBR boot code will be replaced\n", .{});
     if (!confirm(yes)) {
         out("Aborted; nothing was written.\n", .{});
@@ -170,7 +204,6 @@ fn installBios(args: []const [:0]const u8) !u8 {
 
 // ---- install-uefi ----------------------------------------------------------
 
-const boot_guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const efivars = "/sys/firmware/efi/efivars";
 
 /// Splits `/dev/nvme0n1p1` into (`/dev/nvme0n1`, 1) and `/dev/sda2` into
@@ -271,9 +304,21 @@ fn mountSubvol(dir: []const u8, buf: []u8) ?[]const u8 {
     return found;
 }
 
+/// What is at `path`, where a loader is about to be written.
+fn existingLoader(path: []const u8) !enum { none, dklilo, foreign } {
+    const data = Io.Dir.cwd().readFileAlloc(io_global, path, gpa_global, .limited(16 << 20)) catch |e| switch (e) {
+        error.FileNotFound => return .none,
+        error.StreamTooLong => return .foreign, // far larger than our loaders
+        else => return e,
+    };
+    defer gpa_global.free(data);
+    return if (plan.isDkliloLoader(data)) .dklilo else .foreign;
+}
+
 fn installUefi(args: []const [:0]const u8) !u8 {
     var esp: ?[]const u8 = null;
     var removable = false;
+    var force = false;
     var yes = false;
     var entry_file: ?[]const u8 = null;
     var device: ?[]const u8 = null;
@@ -286,6 +331,8 @@ fn installUefi(args: []const [:0]const u8) !u8 {
             arch = parseArch(args[i]) orelse return 2;
         } else if (std.mem.eql(u8, a, "--removable")) {
             removable = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
         } else if (std.mem.eql(u8, a, "--yes")) {
             yes = true;
         } else if (std.mem.eql(u8, a, "--entry-file") and i + 1 < args.len) {
@@ -309,6 +356,26 @@ fn installUefi(args: []const [:0]const u8) !u8 {
     else
         std.fmt.bufPrint(&rel_buf, "EFI/dklilo/{s}", .{installed}) catch unreachable;
     out("Installing the {s} UEFI boot loader into {s}:\n  copy {d} bytes to {s}/{s}\n", .{ arch.tag(), esp_dir, efi_image.len, esp_dir, target_rel });
+
+    // The fallback path is shared: whatever else boots this medium may be
+    // there. (EFI/dklilo/ is our own directory.)
+    if (removable) {
+        const full = try std.fs.path.join(gpa_global, &.{ esp_dir, target_rel });
+        defer gpa_global.free(full);
+        switch (existingLoader(full) catch |e| {
+            err("dklilo: cannot read the existing {s}: {s}\n", .{ full, @errorName(e) });
+            return 1;
+        }) {
+            .none => {},
+            .dklilo => out("  replacing the dklilo loader that is there\n", .{}),
+            .foreign => if (force) {
+                out("  note: replacing a boot loader that is NOT dklilo (--force)\n", .{});
+            } else {
+                err("dklilo: {s} exists and is not a dklilo loader; another system may need it.\n  Refusing to replace it. Repeat with --force if you are sure.\n", .{full});
+                return 1;
+            },
+        }
+    }
 
     // The boot entry (not needed for removable media).
     var load_option_buf: [512]u8 = undefined;
@@ -369,7 +436,7 @@ fn installUefi(args: []const [:0]const u8) !u8 {
         if (entry_file) |f| {
             try Io.Dir.cwd().writeFile(io_global, .{ .sub_path = f, .data = lo });
         } else {
-            writeBootVariable(lo) catch |e| {
+            createBootEntry(lo) catch |e| {
                 err("dklilo: the loader is installed, but creating the boot entry failed: {s}\n  (is efivarfs mounted at {s}? you can use --entry-file)\n", .{ @errorName(e), efivars });
                 return 1;
             };
@@ -379,64 +446,11 @@ fn installUefi(args: []const [:0]const u8) !u8 {
     return 0;
 }
 
-/// Creates (or updates) our Boot#### variable and puts it first in BootOrder.
-fn writeBootVariable(load_option: []const u8) !void {
-    const attrs = [4]u8{ 7, 0, 0, 0 }; // non-volatile | boot service | runtime
+fn createBootEntry(load_option: []const u8) !void {
     var dir = try Io.Dir.cwd().openDir(io_global, efivars, .{ .iterate = true });
     defer dir.close(io_global);
-
-    // Reuse our entry if one exists, else take the lowest free number.
-    var number: u16 = 0xFFFF;
-    var free: ?u16 = null;
-    var n: u32 = 0;
-    while (n <= 0xFFFF) : (n += 1) {
-        var name: [64]u8 = undefined;
-        const nm = std.fmt.bufPrint(&name, "Boot{X:0>4}-" ++ boot_guid, .{n}) catch unreachable;
-        const data = dir.readFileAlloc(io_global, nm, gpa_global, .limited(4096)) catch {
-            if (free == null) free = @intCast(n);
-            if (n > 0x40 and free != null) break;
-            continue;
-        };
-        defer gpa_global.free(data);
-        // attrs(4) + load attrs(4) + path length(2) + description
-        const desc = "d\x00k\x00l\x00i\x00l\x00o\x00\x00\x00";
-        if (data.len > 10 + desc.len and std.mem.eql(u8, data[10..][0..desc.len], desc)) {
-            number = @intCast(n);
-            break;
-        }
-    }
-    if (number == 0xFFFF) number = free orelse return error.NoFreeBootNumber;
-
-    var name: [64]u8 = undefined;
-    const nm = try std.fmt.bufPrint(&name, "Boot{X:0>4}-" ++ boot_guid, .{number});
-    try writeVar(dir, nm, &attrs, load_option);
-
-    // BootOrder: our entry first, the rest in their old order.
-    var order: [2 * 256]u8 = undefined;
-    var order_len: usize = 0;
-    std.mem.writeInt(u16, order[0..2], number, .little);
-    order_len = 2;
-    if (dir.readFileAlloc(io_global, "BootOrder-" ++ boot_guid, gpa_global, .limited(4096))) |old| {
-        defer gpa_global.free(old);
-        var k: usize = 4;
-        while (k + 2 <= old.len and order_len + 2 <= order.len) : (k += 2) {
-            const v = std.mem.readInt(u16, old[k..][0..2], .little);
-            if (v == number) continue;
-            std.mem.writeInt(u16, order[order_len..][0..2], v, .little);
-            order_len += 2;
-        }
-    } else |_| {}
-    try writeVar(dir, "BootOrder-" ++ boot_guid, &attrs, order[0..order_len]);
+    const number = try bootvars.install(io_global, gpa_global, dir, load_option);
     out("  boot entry Boot{X:0>4} created\n", .{number});
-}
-
-fn writeVar(dir: Io.Dir, name: []const u8, attrs: []const u8, data: []const u8) !void {
-    // efivarfs wants the attributes and the value in a single write().
-    const buf = try gpa_global.alloc(u8, attrs.len + data.len);
-    defer gpa_global.free(buf);
-    @memcpy(buf[0..attrs.len], attrs);
-    @memcpy(buf[attrs.len..], data);
-    try dir.writeFile(io_global, .{ .sub_path = name, .data = buf });
 }
 
 // ---- check -----------------------------------------------------------------

@@ -294,7 +294,18 @@ All readers are read-only and never write to the disk.
   import it and the entry can be created from environments without efivarfs.
 - The installer refuses to overwrite anything in the post-MBR gap that
   isn't zeros or an older dklilo stage 2, so it never clobbers another
-  boot loader or data it doesn't recognise.
+  boot loader or data it doesn't recognise. An older stage 2 owns only the
+  sectors its MBR block list records; without that record, replacing it
+  needs `--force`. A longer older stage 2 is zeroed completely.
+- `install-bios` takes a whole disk with a partition table. It refuses a
+  partition, a FAT, NTFS or exFAT boot sector, an empty table, and a table
+  with an invalid status byte. None of these can be forced.
+- `install-uefi --removable` replaces `\EFI\BOOT\BOOT<ARCH>.EFI` only if it
+  is a dklilo loader; anything else needs `--force`. A dklilo loader is
+  recognised by the headings of its two menu screens.
+- A boot variable that exists but can't be read stops `install-uefi` before
+  any variable is written. A `dklilo` boot entry is reused only for the same
+  partition and loader path.
 
 ## 6. Shared conventions
 

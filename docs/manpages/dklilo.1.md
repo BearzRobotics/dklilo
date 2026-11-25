@@ -6,9 +6,9 @@ dklilo - install and check the dklilo boot loader
 
 **dklilo check** [*conf*] [**--device** *DEV*]
 
-**dklilo install-bios** *disk* [**--yes**]
+**dklilo install-bios** *disk* [**--force**] [**--yes**]
 
-**dklilo install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
+**dklilo install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable** [**--force**]] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
 
 **dklilo config** [**--boot** *DIR*] [**-o** *FILE*] [**--force**] [**--root** *DEV*] [**--append** *STR*] [**--no-windows**]
 
@@ -54,21 +54,35 @@ writes first and asks for confirmation (see **--yes**).
     for on that disk the way the boot loader searches (see FILES in
     **dklilo.conf**(5)) and *conf* is not used.
 
-**install-bios** *disk* [**--yes**]
+**install-bios** *disk* [**--force**] [**--yes**]
 :   Installs stage 1 into the MBR boot code of *disk* and stage 2 into the gap
     before the first partition (MBR) or into the BIOS boot partition, type
-    EF02 (GPT). The partition table is preserved. It refuses to run if the
-    space for stage 2 holds anything other than zeros or an earlier dklilo, if
-    there is not enough room, if a GPT disk has no BIOS boot partition, or if
-    the disk has no partition table.
+    EF02 (GPT). The partition table is preserved. It refuses to run if *disk*
+    is a partition, if its first sector is a FAT, NTFS or exFAT boot sector,
+    if there is no partition table, or it is empty or has an invalid status
+    byte, if a GPT disk has no BIOS boot partition, if there is not enough
+    room, or if the space for stage 2 holds anything other than zeros or an
+    earlier dklilo.
 
-**install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable**] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
+    An earlier stage 2 owns the sectors recorded in the MBR block list, and
+    what follows them must be zeros. A longer earlier stage 2 is zeroed
+    completely. If the MBR no longer records the length (for example because
+    another system rewrote the boot code), it refuses unless **--force** is
+    given.
+
+**install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable** [**--force**]] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
 :   Copies the UEFI loader to the mounted EFI System Partition *esp-dir*:
     `EFI/dklilo/dklilo<ARCH>.efi` (`dkliloX64.efi`, `dkliloAA64.efi`,
     `dkliloARM.efi`, `dkliloRISCV64.efi`), or
     `EFI/BOOT/BOOT<ARCH>.EFI` with **--removable**. Without **--removable** it also creates a firmware boot
     entry and puts it first in BootOrder through efivarfs
-    (`/sys/firmware/efi/efivars`).
+    (`/sys/firmware/efi/efivars`). With **--removable**, an existing file at
+    that path is replaced only if it is a dklilo loader (of any version);
+    anything else needs **--force**.
+
+    A boot entry named "dklilo" for the same partition and loader path is
+    updated; otherwise the lowest unused number is taken. If an existing boot
+    variable or BootOrder cannot be read, no boot variable is written.
 
 **config** [**--boot** *DIR*] [**-o** *FILE*] [**--force**] [**--root** *DEV*] [**--append** *STR*] [**--no-windows**]
 :   Generates a first `dklilo.conf`. It lists the kernels (`vmlinuz*`) in
@@ -93,6 +107,17 @@ writes first and asks for confirmation (see **--yes**).
 :   Do not ask for confirmation (**install-bios**, **install-uefi**). Without
     it, the command prints what it will write and waits for `yes` on standard
     input. Anything else aborts with nothing written.
+
+**--force**
+:   (**install-bios**) Replace an earlier dklilo stage 2 whose length the MBR
+    no longer records. It does not allow writing over other data, and none of
+    the other refusals can be overridden. Check first that nothing else uses
+    the space after it.
+
+:   (**install-uefi --removable**) Replace a loader at
+    `EFI/BOOT/BOOT<ARCH>.EFI` that is not dklilo's. No copy is kept.
+
+:   (**config**) Overwrite an existing **-o** file.
 
 **--arch** *ARCH*
 :   (**install-uefi**, **mkiso-images**) Which UEFI loader to install:
@@ -124,9 +149,6 @@ writes first and asks for confirmation (see **--yes**).
 **-o** *FILE*
 :   (**config**) Write the configuration to *FILE*. Default: standard output.
     An existing *FILE* is not overwritten without **--force**.
-
-**--force**
-:   (**config**) Overwrite an existing **-o** file.
 
 **--root** *DEV*
 :   (**config**) The root device or specification (`PARTUUID=`, `UUID=`,
@@ -206,6 +228,17 @@ Build a hybrid BIOS and UEFI ISO (kernel and `dklilo.conf` go in `tree/`):
 `dklilo: the space for stage 2 holds data that is not zeros or an older dklilo.`
 :   **install-bios** refused to overwrite what may be another boot loader.
     Nothing was written.
+
+`dklilo: PATH is a partition.` / `PATH starts with a filesystem's boot sector`
+:   **install-bios** was given something other than a whole disk. Nothing was
+    written.
+
+`dklilo: an older dklilo stage 2 is there, but the MBR no longer records its length`
+:   See **--force**. Nothing was written.
+
+`dklilo: FILE exists and is not a dklilo loader`
+:   **install-uefi --removable** refused to replace another boot loader. See
+    **--force**. Nothing was written.
 
 `dklilo: cannot tell which partition DIR is on; pass --device /dev/...`
 :   **install-uefi** could not map the ESP to a partition. Use **--device**.
