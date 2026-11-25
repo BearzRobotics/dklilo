@@ -37,6 +37,9 @@ pub const DirEntry = struct {
     inode: Inode,
 };
 
+/// A FAT directory holds at most 65536 entries of 32 bytes.
+const max_dir_bytes = 65536 * 32;
+
 const attr_volume_id = 0x08;
 const attr_directory = 0x10;
 const attr_lfn = 0x0F;
@@ -81,8 +84,9 @@ pub const Fs = struct {
         if (reserved == 0 or nfats == 0 or nfats > 2 or fat_size == 0 or total == 0) return error.BadMagic;
 
         const root_sectors: u32 = (@as(u32, root_entries) * 32 + bps - 1) / bps;
-        const data_sectors = total -| (reserved + @as(u32, nfats) * fat_size + root_sectors);
-        const count = data_sectors / spc;
+        // In 64 bits: two tables of up to 2^32 sectors each.
+        const before_data = @as(u64, reserved) + @as(u64, nfats) * fat_size + root_sectors;
+        const count: u32 = @intCast((total -| before_data) / spc);
         const kind: Kind = if (count < 4085) .fat12 else if (count < 65525) .fat16 else .fat32;
         if ((kind == .fat32) != is32_layout) return error.BadMagic;
 
@@ -99,7 +103,7 @@ pub const Fs = struct {
             .fat_start = @as(u64, reserved) * bps,
             .root_start = (@as(u64, reserved) + @as(u64, nfats) * fat_size) * bps,
             .root_bytes = root_sectors * bps,
-            .data_start = (@as(u64, reserved) + @as(u64, nfats) * fat_size + root_sectors) * bps,
+            .data_start = before_data * bps,
             .root_cluster = if (kind == .fat32) std.mem.readInt(u32, bs[44..48], .little) else 0,
             .cluster_count = count,
             .serial = std.mem.readInt(u32, bs[if (kind == .fat32) 67 else 39..][0..4], .little),
@@ -215,7 +219,12 @@ pub const Fs = struct {
             const within = it.pos % fs.cluster_size;
             if (it.pos != 0 and within == 0) {
                 it.cluster = (try fs.next(it.cluster)) orelse return false;
+                // Also what ends a cluster chain that loops back on itself.
+                if (it.pos >= max_dir_bytes) return error.Corrupt;
             }
+            // The first cluster comes straight from a directory entry (or the
+            // boot sector) and has not been through `next`.
+            if (it.cluster < 2 or it.cluster >= fs.cluster_count + 2) return error.Corrupt;
             try fs.region.readAt(fs.clusterOffset(it.cluster) + within, fs.dir_buf);
             return true;
         }

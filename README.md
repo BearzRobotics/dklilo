@@ -64,6 +64,7 @@ You need [Zig](https://ziglang.org/) **0.17.1**.
 zig build            # everything: stage1/stage2, the UEFI loaders, the dklilo tool
 zig build -Dtarget=aarch64-linux-none   # the tool for an AArch64 machine
 zig build test       # unit tests against images made by real mkfs tools
+                     # (on x86_64 the reader tests also run as 32-bit)
 ```
 
 Artifacts land in `zig-out/`. `zig-out/bin/dklilo` is the installer and tools

@@ -323,6 +323,8 @@ pub const Fs = struct {
 
         const blocks_count = @as(u64, sb.blocks_count_lo) |
             (if (is64) @as(u64, sb.blocks_count_hi) << 32 else 0);
+        // With this, the byte offset of any block below `blocks_count` fits.
+        _ = std.math.mul(u64, blocks_count, block_size) catch return error.Corrupt;
 
         const node_buf = try allocator.alloc(u8, block_size);
         errdefer allocator.free(node_buf);
@@ -370,13 +372,24 @@ pub const Fs = struct {
     fn readGroupDesc(self: *Fs, group: u32) Error!GroupDesc {
         const gdt_block: u64 = @as(u64, self.first_data_block) + 1;
         const off = gdt_block * self.block_size + @as(u64, group) * self.desc_size;
+        // A descriptor may be longer than the fields known here (any size up
+        // to a block): only those are kept, but all of it is checksummed.
         var raw: [64]u8 = @splat(0);
-        try self.region.readAt(off, raw[0..self.desc_size]);
+        const kept = @min(self.desc_size, raw.len);
+        try self.region.readAt(off, raw[0..kept]);
         if (self.metadata_csum) {
             var c = crc.crc32cUpdate(self.csum_seed, std.mem.asBytes(&std.mem.nativeToLittle(u32, group)));
             c = crc.crc32cUpdate(c, raw[0..30]);
             c = crc.crc32cUpdate(c, &[_]u8{ 0, 0 });
-            if (self.desc_size > 32) c = crc.crc32cUpdate(c, raw[32..self.desc_size]);
+            if (kept > 32) c = crc.crc32cUpdate(c, raw[32..kept]);
+            var at: u32 = kept;
+            var rest: [64]u8 = undefined;
+            while (at < self.desc_size) {
+                const n = @min(self.desc_size - at, rest.len);
+                try self.region.readAt(off + at, rest[0..n]);
+                c = crc.crc32cUpdate(c, rest[0..n]);
+                at += n;
+            }
             const stored = std.mem.readInt(u16, raw[30..32], .little);
             if (@as(u16, @truncate(c)) != stored) return error.ChecksumMismatch;
         }
@@ -390,7 +403,9 @@ pub const Fs = struct {
         const gd = try self.readGroupDesc(group);
         const table = @as(u64, gd.inode_table_lo) |
             (if (self.desc_size >= 64) @as(u64, gd.inode_table_hi) << 32 else 0);
-        const off = table * self.block_size + @as(u64, index) * self.inode_size;
+        if (table >= self.blocks_count) return error.Corrupt;
+        const off = std.math.add(u64, table * self.block_size, @as(u64, index) * self.inode_size) catch
+            return error.Corrupt;
 
         var ino: Inode = undefined;
         ino.raw = @splat(0);
@@ -437,6 +452,12 @@ pub const Fs = struct {
     const Run = struct { phys: u64, run: u64 };
 
     fn mapExtents(self: *Fs, ino: *const Inode, lblock: u64) Error!Run {
+        // Extent trees number a file's blocks with 32 bits.
+        const max_blocks: u64 = 1 << 32;
+        if (lblock >= max_blocks) return error.Corrupt;
+        // The first block that belongs to a later subtree than the one being
+        // walked. A hole after a node's last entry ends no later than this.
+        var limit = max_blocks;
         var node: [60]u8 = undefined;
         @memcpy(&node, ino.iBlock());
         var node_slice: []const u8 = &node;
@@ -474,18 +495,28 @@ pub const Fs = struct {
                         const within = lblock - e.block;
                         if (uninit) return .{ .phys = 0, .run = len - within };
                         const start = @as(u64, e.start_lo) | (@as(u64, e.start_hi) << 32);
+                        // The whole extent must lie inside the filesystem.
+                        if (start == 0 or start >= self.blocks_count or len > self.blocks_count - start)
+                            return error.Corrupt;
                         return .{ .phys = start + within, .run = len - within };
                     }
                 }
-                // In a hole: it lasts until the next extent (or forever).
-                return .{ .phys = 0, .run = (next_start orelse std.math.maxInt(u32) + 1) - lblock };
+                // In a hole: it lasts until the next extent, which may be the
+                // first one of the next leaf.
+                return .{ .phys = 0, .run = (next_start orelse limit) - lblock };
             }
 
             // Index node: descend into the last child starting at or before lblock.
             var child: ?ExtentIdx = null;
             for (0..hdr.entries) |i| {
                 const e = std.mem.bytesAsValue(ExtentIdx, node_slice[12 + i * 12 ..][0..12]).*;
-                if (e.block <= lblock) child = e else break;
+                if (e.block <= lblock) {
+                    child = e;
+                } else {
+                    // Later than `lblock`, so `limit` stays above it.
+                    limit = @min(limit, e.block);
+                    break;
+                }
             }
             const c = child orelse return .{ .phys = 0, .run = 1 };
             const blk = @as(u64, c.leaf_lo) | (@as(u64, c.leaf_hi) << 32);
@@ -615,11 +646,12 @@ pub const Fs = struct {
             if (p + 16 + name_len > self.inode_size) return error.Corrupt;
             const name = ino.raw[p + 16 ..][0..name_len];
             if (name_index == 7 and std.mem.eql(u8, name, "data")) {
-                if (entries + value_off + value_size > self.inode_size) return error.Corrupt;
-                const total = first + value_size;
+                // In 64 bits: `value_size` alone can fill 32.
+                if (@as(u64, entries) + value_off + value_size > self.inode_size) return error.Corrupt;
+                const total = @as(u64, first) + value_size;
                 if (ino.size != total or total > out.len) return error.Corrupt;
                 @memcpy(out[first..][0..value_size], ino.raw[entries + value_off ..][0..value_size]);
-                return out[0..total];
+                return out[0..@intCast(total)];
             }
             p += (16 + name_len + 3) & ~@as(usize, 3);
         }
@@ -635,7 +667,9 @@ pub const Fs = struct {
         if (dir.flags & flag_inline_data != 0) return self.walkInlineDir(dir, ctx, cb);
 
         const bs = self.block_size;
-        const blocks = (dir.size + bs - 1) / bs;
+        const blocks = dir.size / bs + @intFromBool(dir.size % bs != 0);
+        // Directories have no holes, so none is bigger than the filesystem.
+        if (blocks > self.blocks_count) return error.Corrupt;
         var lblock: u64 = 0;
         while (lblock < blocks) : (lblock += 1) {
             const r = try self.mapBlock(dir, lblock);

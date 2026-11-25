@@ -226,6 +226,11 @@ pub const DirEntry = struct {
 const Chunk = struct { logical: u64, length: u64, kind: u64, stripe_start: u32, num_stripes: u16 };
 const Stripe = struct { devid: u64, offset: u64 };
 
+/// Sums of values read from the disk: one that overflows means a damaged one.
+fn add(a: u64, b: u64) Error!u64 {
+    return std.math.add(u64, a, b) catch error.Corrupt;
+}
+
 pub const Fs = struct {
     allocator: std.mem.Allocator,
     region: region_mod.Region,
@@ -407,14 +412,15 @@ pub const Fs = struct {
     /// logical address `logical`: one per usable mirror, best first.
     pub fn mapLogical(self: *const Fs, logical: u64, len: u64, out: *[4]u64) Error!usize {
         for (self.chunks) |c| {
-            if (logical < c.logical or logical >= c.logical + c.length) continue;
-            if (len > c.logical + c.length - logical) return error.Corrupt;
+            // Subtract rather than add: `c.logical + c.length` may overflow.
+            if (logical < c.logical or logical - c.logical >= c.length) continue;
+            if (len > c.length - (logical - c.logical)) return error.Corrupt;
             if (c.kind & (bg_raid0 | bg_raid10 | bg_raid5 | bg_raid6) != 0) return error.Unsupported;
             var n: usize = 0;
             for (self.stripes[c.stripe_start..][0..c.num_stripes]) |s| {
                 if (s.devid != self.devid) continue; // a mirror on another device
                 if (n < out.len) {
-                    out[n] = s.offset + (logical - c.logical);
+                    out[n] = try add(s.offset, logical - c.logical);
                     n += 1;
                 }
             }
@@ -454,6 +460,19 @@ pub const Fs = struct {
         return last;
     }
 
+    /// Checks that a tree block's `n` entries of `each` bytes fit in it. By
+    /// division, because `n * each` can wrap where `usize` is 32 bits.
+    fn checkCount(buf: []const u8, n: u32, each: usize) Error!void {
+        if (n > (buf.len - @sizeOf(NodeHeader)) / each) return error.Corrupt;
+    }
+
+    /// The bytes of a leaf item, whose offset counts from the end of the header.
+    fn itemData(buf: []const u8, it: Item) Error![]const u8 {
+        const start = @as(u64, @sizeOf(NodeHeader)) + it.offset;
+        if (start + it.size > buf.len) return error.Corrupt;
+        return buf[@intCast(start)..][0..it.size];
+    }
+
     fn keyAt(buf: []const u8, off: usize) Key {
         return std.mem.bytesAsValue(Key, buf[off..][0..17]).*;
     }
@@ -474,19 +493,17 @@ pub const Fs = struct {
         const base = @sizeOf(NodeHeader);
 
         if (hdr.level == 0) {
-            if (base + @as(usize, n) * @sizeOf(Item) > buf.len) return error.Corrupt;
+            try checkCount(buf, n, @sizeOf(Item));
             for (0..n) |i| {
                 const it = std.mem.bytesAsValue(Item, buf[base + i * @sizeOf(Item) ..][0..@sizeOf(Item)]).*;
                 if (Key.order(it.key, min) == .lt) continue;
                 if (Key.order(it.key, max) == .gt) return true;
-                const start = base + @as(usize, it.offset);
-                if (start + it.size > buf.len) return error.Corrupt;
-                if (cb(ctx, it.key, buf[start..][0..it.size])) return true;
+                if (cb(ctx, it.key, try itemData(buf, it))) return true;
             }
             return false;
         }
 
-        if (base + @as(usize, n) * @sizeOf(KeyPtr) > buf.len) return error.Corrupt;
+        try checkCount(buf, n, @sizeOf(KeyPtr));
         for (0..n) |i| {
             const kp = std.mem.bytesAsValue(KeyPtr, buf[base + i * @sizeOf(KeyPtr) ..][0..@sizeOf(KeyPtr)]).*;
             if (Key.order(kp.key, max) == .gt) return true;
@@ -516,20 +533,18 @@ pub const Fs = struct {
         const n: usize = hdr.nritems;
         const base = @sizeOf(NodeHeader);
         if (hdr.level == 0) {
-            if (base + n * @sizeOf(Item) > buf.len) return error.Corrupt;
+            try checkCount(buf, hdr.nritems, @sizeOf(Item));
             var i = n;
             while (i > 0) {
                 i -= 1;
                 const it = std.mem.bytesAsValue(Item, buf[base + i * @sizeOf(Item) ..][0..@sizeOf(Item)]).*;
                 if (Key.order(it.key, target) != .gt) {
-                    const start = base + @as(usize, it.offset);
-                    if (start + it.size > buf.len) return error.Corrupt;
-                    return .{ .key = it.key, .data = buf[start..][0..it.size] };
+                    return .{ .key = it.key, .data = try itemData(buf, it) };
                 }
             }
             return null;
         }
-        if (base + n * @sizeOf(KeyPtr) > buf.len) return error.Corrupt;
+        try checkCount(buf, hdr.nritems, @sizeOf(KeyPtr));
         var i = n;
         while (i > 0) {
             i -= 1;
@@ -784,14 +799,14 @@ pub const Fs = struct {
                     const got = try self.decompress(compression, inline_data, @intCast(ram));
                     plain = got;
                 }
-                const rel: usize = @intCast(pos - file_off);
-                if (rel >= plain.len) {
+                if (pos - file_off >= plain.len) {
                     // Inline data shorter than the file size: zero tail.
                     const n = left;
                     @memset(buf[done..][0..n], 0);
                     done += n;
                     continue;
                 }
+                const rel: usize = @intCast(pos - file_off);
                 const n = @min(left, plain.len - rel);
                 @memcpy(buf[done..][0..n], plain[rel..][0..n]);
                 done += n;
@@ -804,7 +819,7 @@ pub const Fs = struct {
             const ext_off = std.mem.readInt(u64, fe.data[37..45], .little);
             const num_bytes = std.mem.readInt(u64, fe.data[45..53], .little);
             const ram_bytes = std.mem.readInt(u64, fe.data[8..16], .little);
-            if (pos >= file_off + num_bytes) {
+            if (pos >= try add(file_off, num_bytes)) {
                 // `pos` lies in a gap after this extent.
                 const next = try self.nextExtentStart(ino, pos);
                 const n: usize = @intCast(@min(@as(u64, left), next -| pos));
@@ -817,12 +832,12 @@ pub const Fs = struct {
             if (kind == 2 or disk_bytenr == 0) {
                 @memset(buf[done..][0..n], 0); // preallocated or sparse extent
             } else if (compression == .none) {
-                try self.readLogical(disk_bytenr + ext_off + within, buf[done..][0..n]);
+                try self.readLogical(try add(disk_bytenr, try add(ext_off, within)), buf[done..][0..n]);
             } else {
                 const plain = try self.loadCompressed(compression, disk_bytenr, disk_num, ram_bytes);
-                const rel: usize = @intCast(ext_off + within);
-                if (rel + n > plain.len) return error.Corrupt;
-                @memcpy(buf[done..][0..n], plain[rel..][0..n]);
+                const rel = try add(ext_off, within);
+                if (rel > plain.len or n > plain.len - rel) return error.Corrupt;
+                @memcpy(buf[done..][0..n], plain[@intCast(rel)..][0..n]);
             }
             done += n;
         }
@@ -856,7 +871,7 @@ pub const Fs = struct {
             // Map in sector-sized pieces only as far as the chunk allows.
             var piece: usize = buf.len - done;
             const n = while (true) {
-                if (self.mapLogical(logical + done, piece, &phys)) |count| break count else |e| {
+                if (self.mapLogical(try add(logical, done), piece, &phys)) |count| break count else |e| {
                     if (e != error.Corrupt or piece <= self.sectorsize) return e;
                     piece = @max(self.sectorsize, piece / 2);
                 }
@@ -872,7 +887,6 @@ pub const Fs = struct {
         if (self.cache_extent == disk_bytenr and self.cache_len == ram_bytes) return self.ram_buf[0..self.cache_len];
         if (disk_num > self.comp_buf.len or ram_bytes > max_compressed_extent) return error.Corrupt;
         try self.readLogical(disk_bytenr, self.comp_buf[0..@intCast(disk_num)]);
-        self.cache_extent = 0;
         const out = try self.decompress(c, self.comp_buf[0..@intCast(disk_num)], @intCast(ram_bytes));
         self.cache_extent = disk_bytenr;
         self.cache_len = out.len;
@@ -882,6 +896,9 @@ pub const Fs = struct {
     /// Decompresses `in` into `ram_buf`; the result must be `expect` bytes.
     fn decompress(self: *Fs, c: Compression, in: []const u8, expect: usize) Error![]const u8 {
         const out = self.ram_buf;
+        // Whatever extent was cached in `ram_buf` is about to be overwritten,
+        // also by inline extents, which don't go through `loadCompressed`.
+        self.cache_extent = 0;
         self.debug_decompressed += 1;
         const n: usize = switch (c) {
             .none => unreachable,

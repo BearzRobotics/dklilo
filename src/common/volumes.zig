@@ -293,7 +293,9 @@ pub const Set = struct {
     /// Like `readFile`, for a config path with an optional subvolume.
     pub fn readSpec(self: *Set, default: *Volume, spec: []const u8, subvol: ?[]const u8) Error![]u8 {
         var o = try self.openFile(default, spec, subvol);
-        const buf = try self.allocator.alloc(u8, @intCast(o.file.size));
+        // The BIOS loader is 32-bit: a file's size need not fit in a `usize`.
+        const size = std.math.cast(usize, o.file.size) orelse return error.OutOfMemory;
+        const buf = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(buf);
         const n = try o.fs.readAt(&o.file, 0, buf);
         if (n != buf.len) return error.Corrupt;

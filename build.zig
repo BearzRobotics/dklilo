@@ -217,13 +217,34 @@ pub fn build(b: *std.Build) void {
     common_tests.step.dependOn(&gen.step);
     for ([_][]const u8{
         "manifest.txt", "manifest-fat.txt", "ext4.img", "ext4-1k.img", "ext4-64bit.img", "ext3.img",
-        "ext2.img",     "ext4-inline.img",  "mbr.img",  "gpt.img",
+        "ext2.img",     "ext4-inline.img",  "mbr.img",  "gpt.img",     "ext4-holes.img", "ext4-holes.bin",
     }) |name| {
         const path = b.pathJoin(&.{ fixtures_dir, name });
         common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(path) });
     }
     const test_step = b.step("test", "Run unit tests against real filesystem images");
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
+
+    // The BIOS loader is 32-bit, where `usize` arithmetic on values read from
+    // a disk can wrap. Run the same reader tests as a 32-bit program too; an
+    // x86_64 Linux host runs it directly.
+    if (b.graph.host.result.cpu.arch == .x86_64 and b.graph.host.result.os.tag == .linux) {
+        const tests32 = b.addTest(.{
+            .name = "test32",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/common/root.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .x86, .os_tag = .linux, .abi = .none }),
+                .optimize = .Debug,
+                .imports = &.{.{ .name = "fsread", .module = fsread }},
+            }),
+        });
+        tests32.root_module.addOptions("test_options", test_options);
+        tests32.root_module.import_table = common_tests.root_module.import_table.clone(b.allocator) catch @panic("OOM");
+        tests32.step.dependOn(&gen.step);
+        const run32 = b.addRunArtifact(tests32);
+        run32.skip_foreign_checks = true;
+        test_step.dependOn(&run32.step);
+    }
 
     const installer_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -100,7 +100,8 @@ pub const MemDisk = struct {
 
     fn read(ctx: *anyopaque, lba: u64, buf: []u8) Error!void {
         const self: *MemDisk = @ptrCast(@alignCast(ctx));
-        const off = lba * self.sector_size;
+        // `readSectors` has checked that the range is on the device.
+        const off: usize = @intCast(lba * self.sector_size);
         @memcpy(buf, self.data[off..][0..buf.len]);
     }
 };

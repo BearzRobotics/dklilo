@@ -72,6 +72,33 @@ mk ext3       mkfs.ext3 -F -q -b 4096
 # Inline data: only the small files fit, but the directories do too.
 mk ext4-inline mkfs.ext4 -F -q -b 4096 -O inline_data
 
+# One file with 600 separate extents on 1 KiB blocks (one block of data, two of
+# hole): too many for one extent-tree leaf, so there are holes where one leaf
+# ends and the next begins. Kept beside its original for comparison.
+mkdir "$w/holes"
+i=0; while [ $i -lt 600 ]; do
+    head -c 1024 /dev/urandom |
+        dd of="$w/holes/holes" bs=1024 seek=$((i * 3)) iflag=fullblock conv=notrunc 2>/dev/null
+    i=$((i + 1))
+done
+cp "$w/holes/holes" "$out/ext4-holes.bin"
+truncate -s 16M "$out/ext4-holes.img"
+mkfs.ext4 -F -q -b 1024 -d "$w/holes" "$out/ext4-holes.img" >/dev/null 2>&1
+
+# 128-byte group descriptors (any power of two from 64 up to the block size is
+# valid), in several block groups, so the descriptor stride matters.
+mk ext4-desc128 mkfs.ext4 -F -q -b 4096 -g 1024 -O 64bit,metadata_csum -E desc_size=128
+
+# No checksums, so a test can change one on-disk value and have it believed.
+mkdir "$w/plain"; head -c 20000 /dev/urandom > "$w/plain/f"
+truncate -s 16M "$out/ext4-nocsum.img"
+mkfs.ext4 -F -q -b 4096 -O '64bit,^metadata_csum' -d "$w/plain" "$out/ext4-nocsum.img" >/dev/null 2>&1
+
+# A file just over 4 GiB (all hole): its size doesn't fit a 32-bit `usize`.
+mkdir "$w/huge"; truncate -s 4294967312 "$w/huge/huge"
+truncate -s 16M "$out/ext4-huge.img"
+mkfs.ext4 -F -q -b 4096 -d "$w/huge" "$out/ext4-huge.img" >/dev/null 2>&1
+
 # --- btrfs images (need mkfs.btrfs; skipped when it is not installed) -------
 btrfs="${DKLILO_MKFS_BTRFS:-$(command -v mkfs.btrfs || echo "$HOME/.cache/dklilo/mkfs.btrfs")}"
 if [ -x "$btrfs" ]; then
