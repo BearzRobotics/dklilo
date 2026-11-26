@@ -287,6 +287,9 @@ fn bootLinux(
     }
 
     say("\r\nLoading {s}...", .{kernel_spec});
+    if (set.openFile(default, kernel_spec, subvol)) |o| {
+        if (o.fs.needsRecovery()) say("\r\nwarning: that filesystem was not unmounted cleanly; files may be out of date", .{});
+    } else |_| {}
     const kernel = try readSpec(set, default, kernel_spec, subvol);
     defer allocator.free(kernel);
 

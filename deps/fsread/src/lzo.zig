@@ -28,8 +28,8 @@ pub const Error = error{
 };
 
 /// Decompresses one LZO1X stream from `in` into `out`; returns the number of
-/// bytes written. Stops at the end-of-stream marker, or at the end of input
-/// when the producer omitted it (btrfs segments have one).
+/// bytes written. The stream must end with its end-of-stream marker (btrfs
+/// segments have one): input that runs out first is `error.InputOverrun`.
 pub fn decompress(in: []const u8, out: []u8) Error!usize {
     var ip: usize = 0;
     var op: usize = 0;

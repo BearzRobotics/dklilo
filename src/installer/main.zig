@@ -621,6 +621,23 @@ fn check(args: []const [:0]const u8) !u8 {
         };
     }
 
+    // A mounted filesystem always looks like this; an unmounted one shouldn't.
+    if (device != null) if (default_vol.filesystem(gpa_global)) |fs| {
+        if (fs.needsRecovery()) out("warn: the configuration's filesystem was not unmounted cleanly; the loader may see older files\n", .{});
+    };
+
+    if (device == null) {
+        // LABEL=, UUID= and PARTUUID= may name another disk.
+        if (usesVolumePrefix(cfg)) disks.addLocal(&set);
+        // Only now that no more volumes are added does a pointer to one last.
+        default_vol = for (set.vols.items) |*v| {
+            if (v.disk == 0 and (partition_number == null or v.number == partition_number.?)) break v;
+        } else {
+            err("dklilo: cannot find the filesystem that holds the configuration\n", .{});
+            return 1;
+        };
+    }
+
     for (diag.warningSlice()) |w| switch (w.kind) {
         .repeated => out("warn: line {d}: '{s}' is given again; the last one counts\n", .{ w.line, w.key }),
         .ignored_value => out("warn: line {d}: part of the value of '{s}' is ignored\n", .{ w.line, w.key }),

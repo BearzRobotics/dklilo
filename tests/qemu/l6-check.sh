@@ -148,5 +148,13 @@ expect "a /dev name is warned about" devname pass "disk name .* is not checked"
 disk_with nowindows 'other = windows'
 expect "a Windows entry with no Windows in sight is warned about" nowindows pass "no Windows"
 
+# ---- a filesystem with a journal to replay (FS-11) --------------------------
+image unclean <<'C'
+image = /boot/vmlinuz
+    label = linux
+C
+debugfs -w -R 'feature needs_recovery' "$d/unclean.img" >/dev/null 2>&1
+expect "an unclean filesystem is warned about" unclean pass "not unmounted cleanly"
+
 [ $failures -eq 0 ] || { echo "FAIL: $failures check case(s)"; exit 1; }
 echo "PASS: check reports configuration problems"

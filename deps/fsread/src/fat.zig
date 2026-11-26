@@ -112,7 +112,27 @@ pub const Fs = struct {
             .fat_buf = fat_buf,
         };
         @memcpy(&self.label_buf, bs[if (kind == .fat32) 71 else 43..][0..11]);
+        self.readRootLabel();
         return self;
+    }
+
+    /// The label proper is a root directory entry; the boot sector's copy is
+    /// often left behind when it changes. A volume whose root can't be read
+    /// keeps that copy.
+    fn readRootLabel(self: *Fs) void {
+        var it = Iter.init(self, self.root());
+        while (it.load() catch false) {
+            var slot: usize = 0;
+            while (slot < self.bytes_per_sector) : (slot += 32) {
+                const e = self.dir_buf[slot..][0..32];
+                if (e[0] == 0) return;
+                if (e[0] != 0xE5 and e[11] != attr_lfn and e[11] & (attr_volume_id | attr_directory) == attr_volume_id) {
+                    @memcpy(&self.label_buf, e[0..11]);
+                    return;
+                }
+            }
+            it.pos += self.bytes_per_sector;
+        }
     }
 
     pub fn deinit(self: *Fs) void {
@@ -173,6 +193,8 @@ pub const Fs = struct {
 
     fn fatByte(self: *Fs, sector: u64, off: usize) Error!u8 {
         if (self.fat_sector != sector) {
+            // A read that fails may still overwrite part of the buffer.
+            self.fat_sector = std.math.maxInt(u64);
             try self.region.readAt(self.fat_start + sector * self.bytes_per_sector, self.fat_buf);
             self.fat_sector = sector;
         }
@@ -284,14 +306,18 @@ pub const Fs = struct {
                 // A short entry; use the long name if its chain is complete
                 // and its checksum matches.
                 var name_len: usize = 0;
-                if (it.lfn_expect == 1 and shortChecksum(e[0..11]) == it.lfn_sum) {
+                var long = it.lfn_expect == 1 and shortChecksum(e[0..11]) == it.lfn_sum;
+                if (long) {
                     for (it.lfn) |ch| {
                         if (ch == 0 or ch == 0xFFFF) break;
-                        name_len += encodeUtf8(ch, it.name[name_len..]) orelse return error.NameTooLong;
+                        // A name that doesn't fit is known by its short one.
+                        name_len += encodeUtf8(ch, it.name[name_len..]) orelse {
+                            long = false;
+                            break;
+                        };
                     }
-                } else {
-                    name_len = shortName(e, &it.name);
                 }
+                if (!long) name_len = shortName(e, &it.name);
                 it.lfn_expect = 0;
 
                 const hi: u32 = if (fs.kind == .fat32) std.mem.readInt(u16, e[20..22], .little) else 0;

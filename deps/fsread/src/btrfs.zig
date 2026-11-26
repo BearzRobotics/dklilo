@@ -4,10 +4,13 @@
 //! tree, subvolumes (including the default one and crossing into subvolumes
 //! while resolving a path), inline and regular extents, sparse files, and zlib,
 //! LZO and zstd compression. Chunk profiles: single, DUP, RAID1/1C3/1C4 (every
-//! tree block is read from the first mirror whose checksum is good, falling
-//! back to the others). RAID0/10/5/6 return `error.Unsupported`.
+//! tree block is read from the first mirror that passes every check, falling
+//! back to the others; data falls back when a copy can't be read). RAID0/10/5/6
+//! and unknown incompatible features return `error.Unsupported`.
 //!
-//! Tree blocks are always checksum-verified. File *data* is not verified (the
+//! Tree blocks are always checksum-verified, and must belong to this filesystem
+//! and be of the level and generation their parent names. File *data* is not
+//! verified (the
 //! checksum tree is not consulted), so a corrupt data copy is not detected.
 //!
 //! Callbacks given to `walkDir` must not call back into the `Fs`: tree walking
@@ -188,6 +191,23 @@ const bg_raid5 = 0x80;
 const bg_raid6 = 0x100;
 
 const max_levels = 8;
+
+/// The incompatible features this reader copes with. It may misread a volume
+/// with any other, so refuses it, as the kernel does. Not here: zoned (0x1000),
+/// extent tree v2 (0x2000), raid stripe tree (0x4000).
+const incompat_known: u64 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 |
+    incompat_metadata_uuid | 0x800 | 0x10000;
+const incompat_metadata_uuid: u64 = 0x400;
+const k_root_backref = 144;
+
+/// A pointer to a tree block, with what the block must say about itself.
+pub const TreeRef = struct {
+    bytenr: u64,
+    generation: u64,
+    level: u8,
+    /// A child's first key, which its parent repeats.
+    first_key: ?Key = null,
+};
 const max_symlinks = 8;
 const max_compressed_extent = 128 * 1024;
 
@@ -198,9 +218,9 @@ pub const mode_symlink = 0o120000;
 
 pub const Inode = struct {
     ino: u64,
-    /// Subvolume id and the logical address of that subvolume's tree root.
+    /// Subvolume id and that subvolume's tree root.
     subvol: u64,
-    root: u64,
+    root: TreeRef,
     mode: u32,
     size: u64,
 
@@ -238,10 +258,14 @@ pub const Fs = struct {
     nodesize: u32,
     devid: u64,
     fsid: [16]u8,
+    /// The id tree block headers carry (the fsid, unless it was changed).
+    metadata_fsid: [16]u8,
+    /// The log tree holds changes that reading ignores.
+    needs_recovery: bool,
     label_buf: [256]u8,
     chunks: []Chunk,
     stripes: []Stripe,
-    root_tree: u64,
+    root_tree: TreeRef,
     default_subvol: u64,
     /// Selected subvolume (see `useSubvolume`); 0 means the default one.
     subvol: u64 = 0,
@@ -264,6 +288,7 @@ pub const Fs = struct {
         if (sb.nodesize < 4096 or sb.nodesize > 65536 or !std.math.isPowerOfTwo(sb.nodesize)) return error.Corrupt;
         if (sb.sectorsize < 512 or sb.sectorsize > 65536 or !std.math.isPowerOfTwo(sb.sectorsize)) return error.Corrupt;
         if (sb.sys_chunk_array_size > 2048) return error.Corrupt;
+        if (sb.incompat_flags & ~incompat_known != 0) return error.Unsupported;
 
         var self = Fs{
             .allocator = allocator,
@@ -272,10 +297,12 @@ pub const Fs = struct {
             .nodesize = sb.nodesize,
             .devid = sb.dev_item.devid,
             .fsid = sb.fsid,
+            .metadata_fsid = if (sb.incompat_flags & incompat_metadata_uuid != 0) sb.metadata_uuid else sb.fsid,
+            .needs_recovery = sb.log_root != 0,
             .label_buf = sb.label,
             .chunks = &.{},
             .stripes = &.{},
-            .root_tree = sb.root,
+            .root_tree = .{ .bytenr = sb.root, .generation = sb.generation, .level = sb.root_level },
             .default_subvol = fs_tree_objectid,
             .bufs = undefined,
             .comp_buf = &.{},
@@ -299,7 +326,7 @@ pub const Fs = struct {
         // 1. Bootstrap the logical->physical map from the superblock.
         try self.parseSysChunks(sb.sys_chunk_array[0..sb.sys_chunk_array_size]);
         // 2. Read the full chunk tree through it.
-        try self.loadChunkTree(sb.chunk_root);
+        try self.loadChunkTree(.{ .bytenr = sb.chunk_root, .generation = sb.chunk_root_generation, .level = sb.chunk_root_level });
         // 3. The default subvolume.
         self.default_subvol = try self.findDefaultSubvolume();
         return self;
@@ -386,7 +413,7 @@ pub const Fs = struct {
         return false;
     }
 
-    fn loadChunkTree(self: *Fs, chunk_root: u64) Error!void {
+    fn loadChunkTree(self: *Fs, chunk_root: TreeRef) Error!void {
         var chunks: std.ArrayList(Chunk) = .empty;
         var stripes: std.ArrayList(Stripe) = .empty;
         errdefer {
@@ -432,8 +459,9 @@ pub const Fs = struct {
 
     // ---- tree blocks ------------------------------------------------------
 
-    /// Reads and verifies the tree block at `bytenr`, trying each mirror.
-    fn readNode(self: *const Fs, bytenr: u64, buf: []u8) Error!void {
+    /// Reads and verifies the tree block `ref` points to, trying each mirror.
+    fn readNode(self: *const Fs, ref: TreeRef, buf: []u8) Error!void {
+        const bytenr = ref.bytenr;
         var phys: [4]u64 = undefined;
         const n = try self.mapLogical(bytenr, self.nodesize, &phys);
         var last: Error = error.Corrupt;
@@ -451,9 +479,20 @@ pub const Fs = struct {
                 last = error.ChecksumMismatch;
                 continue;
             }
-            if (hdr.level > max_levels) {
+            // A block of another filesystem, an older one left at this
+            // address, or one from elsewhere in the tree. (Levels that must
+            // fall by one also keep a walk from going round in circles.)
+            if (!std.mem.eql(u8, &hdr.fsid, &self.metadata_fsid) or hdr.generation != ref.generation or
+                hdr.level != ref.level or hdr.level >= max_levels)
+            {
                 last = error.Corrupt;
                 continue;
+            }
+            if (ref.first_key) |want| {
+                if (hdr.nritems == 0 or Key.order(keyAt(buf, @sizeOf(NodeHeader)), want) != .eq) {
+                    last = error.Corrupt;
+                    continue;
+                }
             }
             return;
         }
@@ -464,6 +503,15 @@ pub const Fs = struct {
     /// division, because `n * each` can wrap where `usize` is 32 bits.
     fn checkCount(buf: []const u8, n: u32, each: usize) Error!void {
         if (n > (buf.len - @sizeOf(NodeHeader)) / each) return error.Corrupt;
+    }
+
+    /// What entry `i` of an interior node says of its child.
+    fn childRef(buf: []const u8, level: u8, i: usize) Error!TreeRef {
+        const base = @sizeOf(NodeHeader);
+        const kp = std.mem.bytesAsValue(KeyPtr, buf[base + i * @sizeOf(KeyPtr) ..][0..@sizeOf(KeyPtr)]).*;
+        // Keys rise strictly, so no child is named twice.
+        if (i > 0 and Key.order(keyAt(buf, base + (i - 1) * @sizeOf(KeyPtr)), kp.key) != .lt) return error.Corrupt;
+        return .{ .bytenr = kp.blockptr, .generation = kp.generation, .level = level - 1, .first_key = kp.key };
     }
 
     /// The bytes of a leaf item, whose offset counts from the end of the header.
@@ -479,15 +527,15 @@ pub const Fs = struct {
 
     /// Calls `cb(ctx, key, data)` for every item with `min <= key <= max` in
     /// the tree rooted at `root`, in key order, until it returns true.
-    fn walk(self: *Fs, root: u64, min: Key, max: Key, ctx: anytype, comptime cb: anytype) Error!void {
+    fn walk(self: *Fs, root: TreeRef, min: Key, max: Key, ctx: anytype, comptime cb: anytype) Error!void {
         _ = try self.walkNode(root, 0, min, max, ctx, cb);
     }
 
     /// Returns true when the walk should stop (callback asked, or past `max`).
-    fn walkNode(self: *Fs, bytenr: u64, depth: usize, min: Key, max: Key, ctx: anytype, comptime cb: anytype) Error!bool {
+    fn walkNode(self: *Fs, ref: TreeRef, depth: usize, min: Key, max: Key, ctx: anytype, comptime cb: anytype) Error!bool {
         if (depth > max_levels) return error.Corrupt;
         const buf = self.bufs[depth];
-        try self.readNode(bytenr, buf);
+        try self.readNode(ref, buf);
         const hdr = std.mem.bytesAsValue(NodeHeader, buf[0..@sizeOf(NodeHeader)]).*;
         const n = hdr.nritems;
         const base = @sizeOf(NodeHeader);
@@ -505,14 +553,14 @@ pub const Fs = struct {
 
         try checkCount(buf, n, @sizeOf(KeyPtr));
         for (0..n) |i| {
-            const kp = std.mem.bytesAsValue(KeyPtr, buf[base + i * @sizeOf(KeyPtr) ..][0..@sizeOf(KeyPtr)]).*;
-            if (Key.order(kp.key, max) == .gt) return true;
+            const child = try childRef(buf, hdr.level, i);
+            if (Key.order(child.first_key.?, max) == .gt) return true;
             // Skip children that end before `min`.
             if (i + 1 < n) {
                 const next = keyAt(buf, base + (i + 1) * @sizeOf(KeyPtr));
                 if (Key.order(next, min) != .gt) continue;
             }
-            if (try self.walkNode(kp.blockptr, depth + 1, min, max, ctx, cb)) return true;
+            if (try self.walkNode(child, depth + 1, min, max, ctx, cb)) return true;
         }
         return false;
     }
@@ -521,14 +569,14 @@ pub const Fs = struct {
 
     /// The item with the greatest key <= `target`, or null. The returned data
     /// points into a tree buffer and is valid until the next tree access.
-    fn searchLe(self: *Fs, root: u64, target: Key) Error!?Found {
+    fn searchLe(self: *Fs, root: TreeRef, target: Key) Error!?Found {
         return self.searchNode(root, 0, target);
     }
 
-    fn searchNode(self: *Fs, bytenr: u64, depth: usize, target: Key) Error!?Found {
+    fn searchNode(self: *Fs, ref: TreeRef, depth: usize, target: Key) Error!?Found {
         if (depth > max_levels) return error.Corrupt;
         const buf = self.bufs[depth];
-        try self.readNode(bytenr, buf);
+        try self.readNode(ref, buf);
         const hdr = std.mem.bytesAsValue(NodeHeader, buf[0..@sizeOf(NodeHeader)]).*;
         const n: usize = hdr.nritems;
         const base = @sizeOf(NodeHeader);
@@ -548,11 +596,11 @@ pub const Fs = struct {
         var i = n;
         while (i > 0) {
             i -= 1;
-            const kp = std.mem.bytesAsValue(KeyPtr, buf[base + i * @sizeOf(KeyPtr) ..][0..@sizeOf(KeyPtr)]).*;
-            if (Key.order(kp.key, target) == .gt) continue;
+            const child = try childRef(buf, hdr.level, i);
+            if (Key.order(child.first_key.?, target) == .gt) continue;
             // If this child has nothing <= target, the answer is the previous
             // child's last item, which the loop reaches next.
-            if (try self.searchNode(kp.blockptr, depth + 1, target)) |f| return f;
+            if (try self.searchNode(child, depth + 1, target)) |f| return f;
         }
         return null;
     }
@@ -578,13 +626,18 @@ pub const Fs = struct {
         return d.location.objectid;
     }
 
-    /// Logical address of the root of tree `id` (a subvolume id).
-    fn treeRoot(self: *Fs, id: u64) Error!u64 {
+    /// The root of tree `id` (a subvolume id).
+    fn treeRoot(self: *Fs, id: u64) Error!TreeRef {
         if (id == 1) return self.root_tree;
         const f = (try self.searchLe(self.root_tree, Key.make(id, k_root_item, std.math.maxInt(u64)))) orelse
             return error.NotFound;
         if (f.key.objectid != id or f.key.kind != k_root_item or f.data.len < 239) return error.NotFound;
-        return std.mem.readInt(u64, f.data[176..184], .little);
+        // `struct btrfs_root_item`: generation, block address and level.
+        return .{
+            .generation = std.mem.readInt(u64, f.data[160..168], .little),
+            .bytenr = std.mem.readInt(u64, f.data[176..184], .little),
+            .level = f.data[238],
+        };
     }
 
     fn currentSubvol(self: *const Fs) u64 {
@@ -610,7 +663,7 @@ pub const Fs = struct {
 
     // ---- inodes ----------------------------------------------------------
 
-    fn readInode(self: *Fs, subvol: u64, root: u64, ino: u64) Error!Inode {
+    fn readInode(self: *Fs, subvol: u64, root: TreeRef, ino: u64) Error!Inode {
         const f = (try self.searchLe(root, Key.make(ino, k_inode_item, 0))) orelse return error.NotFound;
         if (f.key.objectid != ino or f.key.kind != k_inode_item or f.data.len < 160) return error.NotFound;
         return .{
@@ -682,6 +735,16 @@ pub const Fs = struct {
         return self.readInode(dir.subvol, dir.root, f.key.offset);
     }
 
+    /// The directory holding subvolume `id`'s root, in the subvolume above.
+    fn aboveSubvolume(self: *Fs, id: u64) Error!Inode {
+        const f = (try self.searchLe(self.root_tree, Key.make(id, k_root_backref, std.math.maxInt(u64)))) orelse
+            return error.NotFound;
+        if (f.key.objectid != id or f.key.kind != k_root_backref or f.data.len < 8) return error.NotFound;
+        const parent = f.key.offset;
+        const directory = std.mem.readInt(u64, f.data[0..8], .little);
+        return self.readInode(parent, try self.treeRoot(parent), directory);
+    }
+
     const WalkCtx = struct {
         user: *anyopaque,
         cb: *const fn (*anyopaque, DirEntry) bool,
@@ -739,7 +802,12 @@ pub const Fs = struct {
         while (it.next()) |comp| {
             if (comp.len > 255) return error.NameTooLong;
             if (!cur.isDir()) return error.NotDirectory;
-            const next = try self.lookupIn(&cur, comp);
+            // `..` leaves a subvolume, as it does when the filesystem is
+            // mounted, but never goes above the one the path started in.
+            const next = if (std.mem.eql(u8, comp, "..") and cur.ino == first_free_objectid and cur.subvol != top.subvol)
+                try self.aboveSubvolume(cur.subvol)
+            else
+                try self.lookupIn(&cur, comp);
             if (!next.isSymlink()) {
                 cur = next;
                 continue;
@@ -800,8 +868,9 @@ pub const Fs = struct {
                     plain = got;
                 }
                 if (pos - file_off >= plain.len) {
-                    // Inline data shorter than the file size: zero tail.
-                    const n = left;
+                    // Past the inline data: zeros, up to the next extent.
+                    const next = try self.nextExtentStart(ino, pos);
+                    const n: usize = @intCast(@min(@as(u64, left), next - pos));
                     @memset(buf[done..][0..n], 0);
                     done += n;
                     continue;
@@ -870,14 +939,18 @@ pub const Fs = struct {
             var phys: [4]u64 = undefined;
             // Map in sector-sized pieces only as far as the chunk allows.
             var piece: usize = buf.len - done;
-            const n = while (true) {
+            const copies = while (true) {
                 if (self.mapLogical(try add(logical, done), piece, &phys)) |count| break count else |e| {
                     if (e != error.Corrupt or piece <= self.sectorsize) return e;
                     piece = @max(self.sectorsize, piece / 2);
                 }
             };
-            try self.region.readAt(phys[0], buf[done..][0..piece]);
-            _ = n;
+            // A copy that can't be read gives way to the next.
+            for (phys[0..copies], 1..) |p, tried| {
+                if (self.region.readAt(p, buf[done..][0..piece])) |_| break else |e| {
+                    if (tried == copies) return e;
+                }
+            }
             done += piece;
         }
     }

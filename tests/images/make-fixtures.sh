@@ -31,6 +31,8 @@ printf 'long\n' > "$t/boot/sub/$long"
 ln -s hello.txt "$t/boot/link-fast"
 ln -s sub/deeper/file "$t/boot/link-dir"
 ln -s "/boot/sub/deeper/file" "$t/boot/link-abs"
+# Leaves /boot, which is its own subvolume in one btrfs image.
+ln -s ../many/file-with-a-longish-name-7 "$t/boot/link-up"
 slow=$(printf 's%.0s' $(seq 1 100))
 ln -s "$slow" "$t/boot/link-slow-dangling"
 # Highly compressible data (random bytes never compress, so the btrfs
@@ -140,8 +142,19 @@ if command -v mcopy >/dev/null 2>&1; then
     mkf fat32 32 64M
 fi
 
+# A FAT volume too small to reach where a btrfs superblock would be.
+if command -v mcopy >/dev/null 2>&1; then
+    mkfs.fat -n TINY -C "$out/fat-tiny.img" 64 >/dev/null
+    printf 'tiny volume\n' > "$w/hello"
+    mcopy -i "$out/fat-tiny.img" "$w/hello" ::/hello.txt
+fi
+
 # --- ISO 9660 with Rock Ridge (needs xorriso) ---------------------------------
 if command -v xorriso >/dev/null 2>&1; then
+    mkdir "$w/case"
+    printf 'upper\n' > "$w/case/README"
+    printf 'lower\n' > "$w/case/readme"
+    xorriso -as mkisofs -quiet -R -V DKLCASE -o "$out/iso-case.img" "$w/case" >/dev/null 2>&1
     xorriso -as mkisofs -quiet -R -V DKLISO -o "$out/iso.img" "$t" >/dev/null 2>&1
 fi
 

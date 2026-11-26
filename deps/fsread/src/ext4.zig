@@ -222,16 +222,28 @@ comptime {
 const magic = 0xEF53;
 const extent_magic = 0xF30A;
 
-const incompat_compression = 0x1;
+const incompat_filetype = 0x2;
 const incompat_recover = 0x4;
-const incompat_journal_dev = 0x8;
-const incompat_meta_bg = 0x10;
 const incompat_extents = 0x40;
 const incompat_64bit = 0x80;
+const incompat_mmp = 0x100;
+const incompat_flex_bg = 0x200;
+const incompat_ea_inode = 0x400;
 const incompat_csum_seed = 0x2000;
+const incompat_largedir = 0x4000;
 const incompat_inline_data = 0x8000;
+const incompat_encrypt = 0x10000;
+const incompat_casefold = 0x20000;
+/// The incompatible features this reader copes with. It may misread a volume
+/// with any other (compression, meta_bg, an external journal, dirdata, or one
+/// not yet invented), so refuses it, as the kernel does.
+const incompat_known: u32 = incompat_filetype | incompat_recover | incompat_extents | incompat_64bit |
+    incompat_mmp | incompat_flex_bg | incompat_ea_inode | incompat_csum_seed | incompat_largedir |
+    incompat_inline_data | incompat_encrypt | incompat_casefold;
 const ro_compat_metadata_csum = 0x400;
 
+const flag_encrypted = 0x800;
+const flag_index = 0x1000;
 const flag_extents = 0x80000;
 const flag_inline_data = 0x10000000;
 
@@ -306,8 +318,7 @@ pub const Fs = struct {
         const sb = std.mem.bytesAsValue(Superblock, &sb_bytes).*;
         if (sb.magic != magic) return error.BadMagic;
         if (sb.log_block_size > 6) return error.Corrupt; // up to 64 KiB
-        if (sb.feature_incompat & (incompat_compression | incompat_journal_dev | incompat_meta_bg) != 0)
-            return error.Unsupported;
+        if (sb.feature_incompat & ~incompat_known != 0) return error.Unsupported;
         const metadata_csum = sb.feature_ro_compat & ro_compat_metadata_csum != 0;
         if (metadata_csum and crc.crc32cUpdate(0xFFFFFFFF, sb_bytes[0..1020]) != sb.checksum)
             return error.ChecksumMismatch;
@@ -473,7 +484,8 @@ pub const Fs = struct {
             } else if (hdr.depth != expect_depth) return error.Corrupt;
             // Each level below the root is exactly one shallower.
             expect_depth = hdr.depth -| 1;
-            if (12 + @as(usize, hdr.entries) * 12 > node_slice.len) return error.Corrupt;
+            // Entries past `max` would lie outside what the checksum covers.
+            if (hdr.entries > hdr.max or 12 + @as(usize, hdr.max) * 12 > node_slice.len) return error.Corrupt;
 
             if (hdr.depth == 0) {
                 // Leaf: find the last extent starting at or before lblock.
@@ -538,6 +550,8 @@ pub const Fs = struct {
         if (block == 0) return 0;
         if (block >= self.blocks_count) return error.Corrupt;
         if (self.ind_block != block) {
+            // A read that fails may still overwrite part of the buffer.
+            self.ind_block = 0;
             try self.region.readAt(block * self.block_size, self.ind_buf);
             self.ind_block = block;
         }
@@ -582,6 +596,7 @@ pub const Fs = struct {
     /// Reads up to `buf.len` bytes of the file at `offset`; returns the count
     /// (short only at end of file). Holes read as zeros.
     pub fn readAt(self: *Fs, ino: *const Inode, offset: u64, buf: []u8) Error!usize {
+        if (ino.flags & flag_encrypted != 0) return error.Unsupported;
         if (offset >= ino.size) return 0;
         const want: usize = @intCast(@min(@as(u64, buf.len), ino.size - offset));
         if (ino.flags & flag_inline_data != 0) {
@@ -664,6 +679,7 @@ pub const Fs = struct {
     /// ".."), stopping early if it returns true.
     pub fn walkDir(self: *Fs, dir: *const Inode, ctx: anytype, comptime cb: anytype) Error!void {
         if (!dir.isDir()) return error.NotDirectory;
+        if (dir.flags & flag_encrypted != 0) return error.Unsupported;
         if (dir.flags & flag_inline_data != 0) return self.walkInlineDir(dir, ctx, cb);
 
         const bs = self.block_size;
@@ -673,22 +689,33 @@ pub const Fs = struct {
         var lblock: u64 = 0;
         while (lblock < blocks) : (lblock += 1) {
             const r = try self.mapBlock(dir, lblock);
-            if (r.phys == 0) continue;
+            // Directories have no holes. (Stepping over them would let a
+            // damaged size keep this loop going practically for ever.)
+            if (r.phys == 0) return error.Corrupt;
             const block = self.node_buf;
             try self.region.readAt(r.phys * bs, block);
-            if (self.metadata_csum) try self.verifyDirBlock(dir, block);
+            if (self.metadata_csum) try self.verifyDirBlock(dir, lblock, block);
             if (try walkBlockEntries(block, ctx, cb)) return;
         }
     }
 
-    fn verifyDirBlock(self: *const Fs, dir: *const Inode, block: []const u8) Error!void {
+    fn verifyDirBlock(self: *const Fs, dir: *const Inode, lblock: u64, block: []const u8) Error!void {
         // Leaf blocks end in a 12-byte tail: inode 0, rec_len 12, type 0xDE.
         // Interior htree blocks have a different tail and are not checked.
         const t = block.len - 12;
         const is_tail = std.mem.readInt(u32, block[t..][0..4], .little) == 0 and
             std.mem.readInt(u16, block[t + 4 ..][0..2], .little) == 12 and
             block[t + 6] == 0 and block[t + 7] == 0xDE;
-        if (!is_tail) return;
+        if (!is_tail) {
+            // Only the index blocks of a hashed directory have no such tail:
+            // its first block, and nodes that look like one empty entry.
+            // (Their own checksum, of another kind, is not verified.)
+            const first_len = std.mem.readInt(u16, block[4..6], .little);
+            const empty = std.mem.readInt(u32, block[0..4], .little) == 0 and
+                (first_len == block.len or (block.len == 65536 and (first_len == 0 or first_len == 65535)));
+            if (dir.flags & flag_index != 0 and (lblock == 0 or empty)) return;
+            return error.ChecksumMismatch;
+        }
         const stored = std.mem.readInt(u32, block[t + 8 ..][0..4], .little);
         if (crc.crc32cUpdate(self.inodeSeed(dir), block[0..t]) != stored) return error.ChecksumMismatch;
     }
@@ -787,6 +814,7 @@ pub const Fs = struct {
     }
 
     fn readAtLink(self: *Fs, ino: *const Inode, buf: []u8) Error!usize {
+        if (ino.flags & flag_encrypted != 0) return error.Unsupported;
         // Short ("fast") symlinks keep the target in i_block and own no data
         // blocks, so i_blocks is zero. Everything else reads like a file.
         if (ino.flags & flag_inline_data == 0 and ino.size < 60 and self.isFastSymlink(ino)) {
@@ -797,9 +825,12 @@ pub const Fs = struct {
     }
 
     fn isFastSymlink(self: *const Fs, ino: *const Inode) bool {
-        _ = self;
-        // i_blocks_lo at offset 28: zero when the target is stored in i_block.
-        // (A fast symlink on a fs with an EA block would count it; rare.)
-        return std.mem.readInt(u32, ino.raw[28..32], .little) == 0;
+        // A fast symlink owns no data blocks. i_blocks_lo (offset 28, in
+        // 512-byte units) also counts an extended attribute block, whose
+        // number is i_file_acl (offsets 104 and 118).
+        const attributes = std.mem.readInt(u32, ino.raw[104..108], .little) != 0 or
+            std.mem.readInt(u16, ino.raw[118..120], .little) != 0;
+        const own: u32 = if (attributes) self.block_size / 512 else 0;
+        return std.mem.readInt(u32, ino.raw[28..32], .little) == own;
     }
 };

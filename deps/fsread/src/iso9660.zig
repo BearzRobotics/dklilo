@@ -2,8 +2,9 @@
 //!
 //! Enough to boot from a DVD or a hybrid ISO written to a USB stick: the
 //! primary volume descriptor, directory records, Rock Ridge `NM` (names), `SL`
-//! (symlinks) and `CE` (continuation areas). Joliet, UDF, multi-extent files
-//! and interleaved files are not supported.
+//! (symlinks) and `CE` (continuation areas). Joliet and UDF are not supported;
+//! multi-extent and interleaved files are listed, but reading one is
+//! `error.Unsupported`.
 //!
 //! Specification: ECMA-119; Rock Ridge: IEEE P1282 / SUSP (IEEE P1281).
 
@@ -25,6 +26,8 @@ pub const Error = error{
 /// ISO 9660 logical block size (2048 on every medium dklilo reads).
 pub const block_size = 2048;
 const max_symlinks = 8;
+/// The most continuation areas one directory record may chain together.
+const max_continuations = 32;
 
 pub const Inode = struct {
     /// First logical block and byte length of the file's data.
@@ -35,6 +38,10 @@ pub const Inode = struct {
     /// Rock Ridge symlink target (when `is_symlink`).
     link: [240]u8 = undefined,
     link_len: u8 = 0,
+    /// The last symlink component read goes on in the next one.
+    link_split: bool = false,
+    /// Multi-extent or interleaved: not readable here.
+    unsupported: bool = false,
 };
 
 pub const Fs = struct {
@@ -67,7 +74,7 @@ pub const Fs = struct {
             .allocator = allocator,
             .region = region,
             .root = .{
-                .extent = std.mem.readInt(u32, root_rec[2..6], .little),
+                .extent = std.mem.readInt(u32, root_rec[2..6], .little) +% root_rec[1],
                 .size = std.mem.readInt(u32, root_rec[10..14], .little),
                 .is_dir = true,
                 .is_symlink = false,
@@ -119,14 +126,17 @@ pub const Fs = struct {
         const name_len: usize = rec[32];
         if (33 + name_len > len) return error.Corrupt;
         const flags = rec[25];
-        if (flags & 0x80 != 0) return error.Unsupported; // multi-extent file
-
-        var e = Entry{ .inode = .{
-            .extent = std.mem.readInt(u32, rec[2..6], .little),
-            .size = std.mem.readInt(u32, rec[10..14], .little),
-            .is_dir = flags & 2 != 0,
-            .is_symlink = false,
-        } };
+        var e = Entry{
+            .inode = .{
+                // Any extended attribute record comes before the data.
+                .extent = std.mem.readInt(u32, rec[2..6], .little) +% rec[1],
+                .size = std.mem.readInt(u32, rec[10..14], .little),
+                .is_dir = flags & 2 != 0,
+                .is_symlink = false,
+                // Flag 0x80: more extents follow. Bytes 26 and 27: interleaving.
+                .unsupported = flags & 0x80 != 0 or rec[26] != 0 or rec[27] != 0,
+            },
+        };
 
         // Plain ISO name: drop the ";1" version and a trailing dot.
         const raw = rec[33..][0..name_len];
@@ -141,11 +151,12 @@ pub const Fs = struct {
         // System use area follows the name (padded to an even offset).
         var su_start = 33 + name_len;
         if (name_len % 2 == 0) su_start += 1;
-        if (su_start < len) try self.parseSystemUse(&e, rec[su_start..len], 0);
+        var continuations: u32 = 0;
+        if (su_start < len) try self.parseSystemUse(&e, rec[su_start..len], 0, &continuations);
         return e;
     }
 
-    fn parseSystemUse(self: *Fs, e: *Entry, area: []const u8, depth: u32) Error!void {
+    fn parseSystemUse(self: *Fs, e: *Entry, area: []const u8, depth: u32, continuations: *u32) Error!void {
         if (depth > 4) return error.Corrupt;
         var p: usize = 0;
         var name_done = false;
@@ -185,11 +196,14 @@ pub const Fs = struct {
                 const off = std.mem.readInt(u32, body[12..16], .little);
                 const clen = std.mem.readInt(u32, body[20..24], .little);
                 if (off > block_size or clen > block_size - off) return error.Corrupt;
+                // Depth alone wouldn't bound it: each area may hold many.
+                continuations.* += 1;
+                if (continuations.* > max_continuations) return error.Corrupt;
                 try self.region.readAt(@as(u64, blk) * block_size, self.cont);
                 // Parse a private copy: recursion would overwrite `cont`.
                 var tmp: [block_size]u8 = undefined;
                 @memcpy(tmp[0..clen], self.cont[off..][0..clen]);
-                try self.parseSystemUse(e, tmp[0..clen], depth + 1);
+                try self.parseSystemUse(e, tmp[0..clen], depth + 1, continuations);
             }
             p += elen;
         }
@@ -205,8 +219,11 @@ pub const Fs = struct {
             const text = comps[p + 2 ..][0..clen];
             var add: []const u8 = text;
             if (cflags & 0x02 != 0) add = "." else if (cflags & 0x04 != 0) add = ".." else if (cflags & 0x08 != 0) add = "";
-            // Separate components with '/', but not after a leading root.
-            if (ino.link_len > 0 and ino.link[ino.link_len - 1] != '/' and !(cflags & 0x08 != 0 and add.len == 0)) {
+            // Separate components with '/', but not after a leading root, nor
+            // between the parts of a split one.
+            const joins = ino.link_split;
+            ino.link_split = cflags & 0x01 != 0;
+            if (!joins and ino.link_len > 0 and ino.link[ino.link_len - 1] != '/' and !(cflags & 0x08 != 0 and add.len == 0)) {
                 if (ino.link_len >= ino.link.len) return error.NameTooLong;
                 ino.link[ino.link_len] = '/';
                 ino.link_len += 1;
@@ -230,6 +247,7 @@ pub const Fs = struct {
     /// stopping when it returns true. The callback must not call into `Fs`.
     pub fn walkDir(self: *Fs, dir: *const Inode, ctx: anytype, comptime cb: anytype) Error!void {
         if (!dir.is_dir) return error.NotDirectory;
+        if (dir.unsupported) return error.Unsupported;
         var pos: u64 = 0;
         while (pos < dir.size) {
             const sec_off = @as(u64, dir.extent) * block_size + pos;
@@ -252,19 +270,21 @@ pub const Fs = struct {
         }
     }
 
-    const Find = struct { name: []const u8, found: ?Inode = null };
+    const Find = struct { name: []const u8, found: ?Inode = null, other_case: ?Inode = null };
     fn findCb(f: *Find, e: DirEntry) bool {
-        if (std.mem.eql(u8, e.name, f.name) or std.ascii.eqlIgnoreCase(e.name, f.name)) {
+        if (std.mem.eql(u8, e.name, f.name)) {
             f.found = e.inode;
             return true;
         }
+        // The first that differs only in case, if no exact one turns up.
+        if (f.other_case == null and std.ascii.eqlIgnoreCase(e.name, f.name)) f.other_case = e.inode;
         return false;
     }
 
     pub fn lookupIn(self: *Fs, dir: *const Inode, name: []const u8) Error!Inode {
         var f = Find{ .name = name };
         try self.walkDir(dir, &f, findCb);
-        return f.found orelse error.NotFound;
+        return f.found orelse f.other_case orelse error.NotFound;
     }
 
     pub fn lookup(self: *Fs, path: []const u8) Error!Inode {
@@ -296,6 +316,7 @@ pub const Fs = struct {
     /// Reads up to `buf.len` bytes of the file at `offset`.
     pub fn readAt(self: *Fs, ino: *const Inode, offset: u64, buf: []u8) Error!usize {
         if (ino.is_dir) return error.IsDirectory;
+        if (ino.unsupported) return error.Unsupported;
         if (offset >= ino.size) return 0;
         const n: usize = @intCast(@min(@as(u64, buf.len), ino.size - offset));
         try self.region.readAt(@as(u64, ino.extent) * block_size + offset, buf[0..n]);
@@ -309,4 +330,12 @@ pub fn isIso(region: region_mod.Region) bool {
     var d: [8]u8 = undefined;
     region.readAt(16 * block_size, &d) catch return false;
     return std.mem.eql(u8, d[1..6], "CD001");
+}
+
+test "a symlink component split across records is joined without a slash" {
+    var ino = Inode{ .extent = 0, .size = 0, .is_dir = false, .is_symlink = true };
+    // flags, length, text: "abc" (continued), "def", then "g".
+    try Fs.appendLink(&ino, &[_]u8{ 0x01, 3, 'a', 'b', 'c' });
+    try Fs.appendLink(&ino, &[_]u8{ 0x00, 3, 'd', 'e', 'f', 0x00, 1, 'g' });
+    try std.testing.expectEqualStrings("abcdef/g", ino.link[0..ino.link_len]);
 }

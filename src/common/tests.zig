@@ -477,7 +477,7 @@ test "btrfs: a damaged metadata copy falls back to the DUP mirror" {
     defer d.close();
     var probe = try btrfs.Fs.open(gpa, d.whole());
     var phys: [4]u64 = undefined;
-    const copies = try probe.mapLogical(probe.root_tree, probe.nodesize, &phys);
+    const copies = try probe.mapLogical(probe.root_tree.bytenr, probe.nodesize, &phys);
     probe.deinit();
     try std.testing.expect(copies >= 2);
 
@@ -508,7 +508,7 @@ test "btrfs: random metadata damage never crashes" {
     d.corrupt_at = null;
     var fs = try btrfs.Fs.open(gpa, d.whole());
     defer fs.deinit();
-    const root = fs.root_tree;
+    const root = fs.root_tree.bytenr;
     var phys: [4]u64 = undefined;
     _ = try fs.mapLogical(root, fs.nodesize, &phys);
     for (0..60) |_| {
@@ -1217,6 +1217,452 @@ test "running out of memory while adding disks neither leaks nor frees twice" {
         defer set.deinit();
         _ = set.addDisk(a.blockDev()) catch continue;
     }
+}
+
+// ---- more damaged and unusual filesystems (docs/bugs FS-08 to FS-14) --------
+
+/// Header fields of a btrfs tree block.
+const btrfs_bytenr = 48;
+const btrfs_generation = 80;
+const btrfs_fsid = 32;
+const btrfs_key_ptr = 33; // key (17), block address, generation
+
+/// Opens a damaged btrfs image and looks up a file in a big directory.
+fn lookupDamaged(img: []u8) !void {
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try btrfs.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    _ = try fs.lookup("/many/file-with-a-longish-name-7");
+}
+
+fn selfReference(_: void, block: []u8) bool {
+    if (block[btrfs_level] == 0) return false;
+    for (0..get(u32, block, btrfs_nritems)) |i| {
+        const ptr = btrfs_header + i * btrfs_key_ptr;
+        put(u64, block, ptr + 17, get(u64, block, btrfs_bytenr));
+        put(u64, block, ptr + 25, get(u64, block, btrfs_generation));
+    }
+    return true;
+}
+
+test "btrfs: a tree block that is its own child is corrupt, not a walk without end" {
+    const img = try loadFixture("btrfs.img");
+    defer gpa.free(img);
+    try patchBtrfs(img, {}, selfReference);
+    try std.testing.expectError(error.Corrupt, lookupDamaged(img));
+}
+
+/// Changes a header field of every leaf.
+fn staleLeaf(field: usize, block: []u8) bool {
+    if (block[btrfs_level] != 0) return false;
+    block[field] ^= 0x01;
+    return true;
+}
+
+test "btrfs: a tree block of another age or filesystem is not accepted" {
+    for ([_]usize{ btrfs_generation, btrfs_fsid }) |field| {
+        const img = try loadFixture("btrfs.img");
+        defer gpa.free(img);
+        try patchBtrfs(img, field, staleLeaf);
+        try std.testing.expectError(error.Corrupt, lookupDamaged(img));
+    }
+}
+
+/// Makes the first copy found of each leaf stale, and leaves the other.
+const OneStaleCopy = struct {
+    seen: [4096]u64 = undefined,
+    n: usize = 0,
+
+    fn change(self: *OneStaleCopy, block: []u8) bool {
+        if (block[btrfs_level] != 0) return false;
+        const bytenr = get(u64, block, btrfs_bytenr);
+        if (std.mem.indexOfScalar(u64, self.seen[0..self.n], bytenr) != null) return false;
+        self.seen[self.n] = bytenr;
+        self.n += 1;
+        block[btrfs_generation] ^= 0x01;
+        return true;
+    }
+};
+
+test "btrfs: a stale copy of a tree block gives way to the good one" {
+    const img = try loadFixture("btrfs-dup.img");
+    defer gpa.free(img);
+    var state = OneStaleCopy{};
+    try patchBtrfs(img, &state, OneStaleCopy.change);
+    try lookupDamaged(img);
+}
+
+/// A disk with a range that can't be read, and that scribbles on the buffer
+/// when it fails, as a real transfer may.
+const BadRange = struct {
+    data: []const u8,
+    from: u64 = 0,
+    to: u64 = 0,
+
+    fn blockDev(self: *BadRange) blockdev.BlockDev {
+        return .{ .ctx = self, .readSectorsFn = read, .sector_size = 512, .sector_count = self.data.len / 512 };
+    }
+    fn read(ctx: *anyopaque, lba: u64, buf: []u8) blockdev.Error!void {
+        const self: *BadRange = @ptrCast(@alignCast(ctx));
+        const off = lba * 512;
+        if (off < self.to and off + buf.len > self.from) {
+            @memset(buf, 0xFF);
+            return error.IoError;
+        }
+        @memcpy(buf, self.data[@intCast(off)..][0..buf.len]);
+    }
+};
+
+/// Reads the logical address of the first extent of an inode.
+const FindExtent = struct {
+    ino: u64,
+    address: u64 = 0,
+
+    fn change(self: *FindExtent, block: []u8) bool {
+        if (block[btrfs_level] != 0) return false;
+        for (0..get(u32, block, btrfs_nritems)) |i| {
+            const it = btrfs_header + i * btrfs_item;
+            if (get(u64, block, it) != self.ino or block[it + 8] != extent_data or get(u64, block, it + 9) != 0) continue;
+            self.address = get(u64, block, btrfs_header + get(u32, block, it + 17) + 21);
+            return true; // unchanged
+        }
+        return false;
+    }
+};
+
+test "btrfs: unreadable data is taken from the other copy" {
+    const img = try loadFixture("btrfs-dup.img");
+    defer gpa.free(img);
+    var d = BadRange{ .data = img };
+    var bd = d.blockDev();
+    var fs = try btrfs.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const ino = try fs.lookup("/boot/medium.bin");
+    var find = FindExtent{ .ino = ino.ino };
+    try patchBtrfs(img, &find, FindExtent.change);
+    var phys: [4]u64 = undefined;
+    try std.testing.expect(try fs.mapLogical(find.address, 4096, &phys) == 2);
+    const want = try gpa.alloc(u8, @intCast(ino.size));
+    defer gpa.free(want);
+    _ = try fs.readAt(&ino, 0, want);
+    d.from = phys[0] + 8192;
+    d.to = d.from + 4096;
+    const got = try gpa.alloc(u8, want.len);
+    defer gpa.free(got);
+    _ = try fs.readAt(&ino, 0, got);
+    try std.testing.expectEqualSlices(u8, want, got);
+}
+
+test "btrfs: a short inline extent zeroes up to the next extent only" {
+    const img = try loadFixture("btrfs.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    const len = 2 << 20;
+    const want = try gpa.alloc(u8, len);
+    defer gpa.free(want);
+    var patch = ItemPatch{ .ino = 0, .kind = extent_data, .at = 0, .field = 13, .value = 0 };
+    {
+        var fs = try btrfs.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+        defer fs.deinit();
+        const ino = try fs.lookup("/boot/big.bin");
+        patch.ino = ino.ino;
+        _ = try fs.readAt(&ino, 0, want);
+    }
+    // The first extent becomes an inline one of a few bytes (compression,
+    // encryption and type all zero); the second still starts at 1 MiB.
+    try patchBtrfs(img, patch, ItemPatch.apply);
+    var fs = try btrfs.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const ino = try fs.lookup("/boot/big.bin");
+    const got = try gpa.alloc(u8, len);
+    defer gpa.free(got);
+    _ = try fs.readAt(&ino, 0, got);
+    try std.testing.expect(std.mem.allEqual(u8, got[4096..][0 .. (1 << 20) - 4096], 0));
+    try std.testing.expectEqualSlices(u8, want[1 << 20 ..], got[1 << 20 ..]);
+}
+
+test "btrfs: .. leaves a subvolume, so relative links across one resolve" {
+    var d = try FileDisk.open("btrfs-subvol.img");
+    defer d.close();
+    var fs = try fs_mod.Fs.open(gpa, d.whole());
+    defer fs.deinit();
+    for ([_][]const u8{ "/boot/link-up", "/boot/sub/../../many/file-with-a-longish-name-7" }) |path| {
+        try std.testing.expectEqual(@as(u64, 5), (try fs.lookup(path)).size);
+    }
+    // But not out of the subvolume that was asked for.
+    try fs.selectSubvolume("boot");
+    try std.testing.expectError(error.NotFound, fs.lookup("/link-up"));
+}
+
+test "btrfs: unknown incompatible features are refused" {
+    const img = try loadFixture("btrfs.img");
+    defer gpa.free(img);
+    const sb = img[0x10000..][0..4096];
+    for ([_]u64{ 1 << 40, 0x1000, 0x2000 }) |feature| { // unknown, zoned, extent tree v2
+        const old = get(u64, sb, 0xBC);
+        defer put(u64, sb, 0xBC, old);
+        put(u64, sb, 0xBC, old | feature);
+        put(u32, sb, 0, ~fsread.crc.crc32cUpdate(0xFFFFFFFF, sb[32..]));
+        var d = disk(img);
+        var bd = d.blockDev();
+        try std.testing.expectError(error.Unsupported, btrfs.Fs.open(gpa, devio.fromRegion(&bd, bd.whole())));
+    }
+}
+
+test "ext4: unknown incompatible features and encrypted files are refused" {
+    const img = try loadFixture("ext4-nocsum.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    const incompat = 1024 + 0x60;
+    const old = get(u32, img, incompat);
+    for ([_]u32{ 0x1000, 0x40000000 }) |feature| { // dirdata, and one not yet invented
+        put(u32, img, incompat, old | feature);
+        try std.testing.expectError(error.Unsupported, ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole())));
+    }
+    // A volume that has the encrypt feature can still be read, except for the
+    // files that are encrypted.
+    put(u32, img, incompat, old | 0x10000);
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    var ino = try fs.lookup("/f");
+    var buf: [64]u8 = undefined;
+    _ = try fs.readAt(&ino, 0, &buf);
+    ino.flags |= 0x800;
+    try std.testing.expectError(error.Unsupported, fs.readAt(&ino, 0, &buf));
+}
+
+test "ext4: a directory block without its checksum tail is not trusted" {
+    const img = try gpa.dupe(u8, @embedFile("ext4.img"));
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    // Find the entry "deeper" in a directory block, then rename it and spoil
+    // the marker of the tail that would show the change.
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, img, at, "deeper")) |found| : (at = found + 1) {
+        if (img[found - 2] != 6 or found % 4096 < 8) continue;
+        const block = img[found - found % 4096 ..][0..4096];
+        if (block[4096 - 5] != 0xDE) continue;
+        block[4096 - 5] = 0;
+        img[found + 3] = 'q';
+        var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+        defer fs.deinit();
+        try std.testing.expectError(error.ChecksumMismatch, fs.lookup("/boot/sub/deeqer/file"));
+        return;
+    }
+    return error.TestEntryNotFound;
+}
+
+test "ext4: more extents than a node has room for is corrupt" {
+    const img = try loadFixture("ext4-nocsum.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    var ino = try fs.lookup("/f");
+    put(u16, &ino.raw, 40 + 4, 0); // eh_max
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.Corrupt, fs.readAt(&ino, 0, &buf));
+}
+
+test "ext4: a hole in a directory is corrupt, not something to step over" {
+    const img = try loadFixture("ext4-nocsum.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    var dir = try fs.lookup("/");
+    dir.size = 8 * fs.block_size; // the rest has no blocks
+    try std.testing.expectError(error.Corrupt, fs.lookupIn(&dir, "absent"));
+}
+
+test "ext4: a short symlink is read from the inode even with an attribute block" {
+    var d = disk(@embedFile("ext4.img"));
+    var bd = d.blockDev();
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const root = try fs.lookup("/boot");
+    var link: ext4.Inode = undefined;
+    // Not followed: find the link's own inode.
+    var find = struct { found: u32 = 0 }{};
+    try fs.walkDir(&root, &find, struct {
+        fn cb(f: *@TypeOf(find), e: ext4.DirEntry) bool {
+            if (!std.mem.eql(u8, e.name, "link-fast")) return false;
+            f.found = e.inode;
+            return true;
+        }
+    }.cb);
+    link = try fs.readInode(find.found);
+    put(u32, &link.raw, 104, 77); // i_file_acl: an attribute block,
+    put(u32, &link.raw, 28, fs.block_size / 512); // counted in i_blocks
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("hello.txt", try fs.readLink(&link, &buf));
+}
+
+test "ext2: a failed read of an indirect block doesn't leave it cached" {
+    var d = BadRange{ .data = @embedFile("ext2.img") };
+    var bd = d.blockDev();
+    var fs = try ext4.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const ino = try fs.lookup("/boot/big.bin");
+    var first: [1024]u8 = undefined;
+    var again: [1024]u8 = undefined;
+    const single = 20 * 1024; // behind the single indirect block
+    _ = try fs.readAt(&ino, single, &first);
+    // Everything fails while a block further on is looked up.
+    d.to = d.data.len;
+    try std.testing.expectError(error.IoError, fs.readAt(&ino, 4 << 20, &again));
+    d.to = 0;
+    _ = try fs.readAt(&ino, single, &again);
+    try std.testing.expectEqualSlices(u8, &first, &again);
+}
+
+test "fat: a failed read of the allocation table doesn't leave it cached" {
+    const img = try loadFixture("fat16.img");
+    defer gpa.free(img);
+    var d = BadRange{ .data = img };
+    var bd = d.blockDev();
+    var fs = try fat.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const ino = try fs.lookup("/boot/big.bin");
+    var first: [8192]u8 = undefined;
+    var again: [8192]u8 = undefined;
+    _ = try fs.readAt(&ino, 0, &first);
+    d.to = FatLayout.of(img).data; // the tables fail, the data doesn't
+    try std.testing.expectError(error.IoError, fs.readAt(&ino, 4 << 20, &again));
+    d.to = 0;
+    _ = try fs.readAt(&ino, 0, &again);
+    try std.testing.expectEqualSlices(u8, &first, &again);
+}
+
+test "fat: a volume too small for the other filesystems is still found" {
+    const img = try loadFixture("fat-tiny.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 12), (try fs.lookup("/hello.txt")).size);
+}
+
+test "fat: the label in the root directory wins over the boot sector's" {
+    const img = try loadFixture("fat16.img");
+    defer gpa.free(img);
+    @memcpy(img[43..54], "NO NAME    ");
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fat.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    try std.testing.expectEqualStrings("DKLFAT", fs.label());
+}
+
+test "fat: a long name that is too long in UTF-8 doesn't hide the rest" {
+    const img = try loadFixture("fat16.img");
+    defer gpa.free(img);
+    // Turn the 255 n's of one name into 255 characters of three bytes each.
+    var changed: usize = 0;
+    var e: usize = FatLayout.of(img).data;
+    while (e + 32 <= img.len) : (e += 32) {
+        if (img[e + 11] != 0x0F or get(u16, img, e + 1) != 'n' or get(u16, img, e + 3) != 'n') continue;
+        for ([_]usize{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 }) |o| {
+            if (get(u16, img, e + o) == 'n') put(u16, img, e + o, 0x20AC);
+        }
+        changed += 1;
+    }
+    try std.testing.expect(changed >= 20);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fat.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    try std.testing.expectError(error.NotFound, fs.lookup("/boot/sub/absent"));
+}
+
+/// The directory record of `name` (a Rock Ridge name) in the ISO's root.
+fn isoRootRecord(img: []u8, plain: []const u8) !usize {
+    const pvd = 16 * 2048;
+    var p: usize = @as(usize, get(u32, img, pvd + 158)) * 2048;
+    while (img[p] != 0) : (p += img[p]) {
+        const name = img[p + 33 ..][0..img[p + 32]];
+        if (std.mem.startsWith(u8, name, plain)) return p;
+    }
+    return error.TestRecordNotFound;
+}
+
+test "iso9660: an exact name wins over one differing only in case" {
+    const img = try loadFixture("iso-case.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    for ([_][]const u8{ "README", "readme" }, [_][]const u8{ "upper\n", "lower\n" }) |name, content| {
+        var path: [16]u8 = undefined;
+        const f = try fs.lookup(try std.fmt.bufPrint(&path, "/{s}", .{name}));
+        var buf: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(content, buf[0..try fs.readAt(&f, 0, &buf)]);
+    }
+}
+
+test "iso9660: a file in several extents is refused without hiding the others" {
+    const img = try loadFixture("iso.img");
+    defer gpa.free(img);
+    img[try isoRootRecord(img, "BOOT") + 25] |= 0x80; // the multi-extent flag
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    _ = try fs.lookup("/many/file-with-a-longish-name-7");
+    try std.testing.expectError(error.Unsupported, fs.lookup("/boot/hello.txt"));
+}
+
+test "iso9660: data starts after the extended attribute record" {
+    const img = try loadFixture("iso-case.img");
+    defer gpa.free(img);
+    const record = try isoRootRecord(img, "README");
+    // Say there is a one-block attribute record, and move the extent back.
+    img[record + 1] = 1;
+    put(u32, img, record + 2, get(u32, img, record + 2) - 1);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    const f = try fs.lookup("/README");
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("upper\n", buf[0..try fs.readAt(&f, 0, &buf)]);
+}
+
+test "iso9660: endless continuation areas are corrupt, not endless work" {
+    const img = try loadFixture("iso-case.img");
+    defer gpa.free(img);
+    // Four areas, as deep as they may go: each of the first three is full of
+    // CE entries that all lead to the next, so following every one of them
+    // means 73 * 73 * 73 areas for this one record.
+    const first: u32 = @intCast(img.len / 2048 - 4);
+    var ce: [28]u8 = @splat(0);
+    @memcpy(ce[0..4], "CE\x1c\x01");
+    put(u32, &ce, 20, 2044); // length
+    @memset(img[first * 2048 ..][0 .. 4 * 2048], 0);
+    for (0..3) |level| {
+        put(u32, &ce, 4, first + @as(u32, @intCast(level)) + 1);
+        const area = img[(first + level) * 2048 ..][0..2048];
+        var p: usize = 0;
+        while (p + 28 <= 2044) : (p += 28) @memcpy(area[p..][0..28], &ce);
+    }
+    put(u32, &ce, 4, first);
+    const record = try isoRootRecord(img, "README");
+    const name_len = img[record + 32];
+    const su = record + 33 + name_len + (1 - name_len % 2);
+    @memcpy(img[su..][0..28], &ce);
+    var d = disk(img);
+    var bd = d.blockDev();
+    var fs = try fs_mod.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
+    defer fs.deinit();
+    try std.testing.expectError(error.Corrupt, fs.lookup("/readme"));
 }
 
 // ---- fuzzing -----------------------------------------------------------------

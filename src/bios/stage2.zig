@@ -165,6 +165,7 @@ fn bootLinux(
     }
     say("\r\nLoading {s}...", .{kernel_spec});
     var k = try open(set, default, kernel_spec, subvol);
+    if (k.fs.needsRecovery()) say("\r\nwarning: that filesystem was not unmounted cleanly; files may be out of date", .{});
     var head: [4096]u8 = undefined;
     const head_len = k.fs.readAt(&k.file, 0, &head) catch |e| {
         say("\r\nread {s}: {s}", .{ kernel_spec, @errorName(e) });

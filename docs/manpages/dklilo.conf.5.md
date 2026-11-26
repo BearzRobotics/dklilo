@@ -129,6 +129,10 @@ that a cloned disk or a USB stick does not take over.
 A command line (`root=`, `append` and what dklilo adds) may be up to 1024
 bytes. A path must name a regular file, or a symlink to one.
 
+Journals and btrfs logs are not replayed. On a filesystem that was not
+unmounted cleanly, the loader warns, and may see files as they were earlier.
+A volume with a feature the loader does not know is not read.
+
 Supported filesystems: ext2, ext3, ext4, btrfs (single, DUP and RAID1 profiles;
 zlib, LZO and zstd compression), FAT12/16/32 and ISO 9660 with Rock Ridge.
 

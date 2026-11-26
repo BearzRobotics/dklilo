@@ -28,16 +28,17 @@ pub const Fs = union(Kind) {
 
     /// Opens the filesystem on `region`, detecting its type.
     pub fn open(allocator: std.mem.Allocator, region: region_mod.Region) Error!Fs {
+        // `OutOfRange` from a probe: too small to be that filesystem.
         if (ext4.Fs.open(allocator, region)) |f| {
             return .{ .ext4 = f };
         } else |e| switch (e) {
-            error.BadMagic => {},
+            error.BadMagic, error.OutOfRange => {},
             else => return e,
         }
         if (btrfs.Fs.open(allocator, region)) |f| {
             return .{ .btrfs = f };
         } else |e| switch (e) {
-            error.BadMagic => {},
+            error.BadMagic, error.OutOfRange => {},
             else => return e,
         }
         if (iso9660.Fs.open(allocator, region)) |f| {
@@ -58,6 +59,17 @@ pub const Fs = union(Kind) {
     pub fn label(self: *const Fs) []const u8 {
         return switch (self.*) {
             inline else => |*f| f.label(),
+        };
+    }
+
+    /// Whether a journal or log holds changes that haven't been written in
+    /// place: after a crash, or while it is mounted. They are not replayed, so
+    /// files may be read as they were earlier.
+    pub fn needsRecovery(self: *const Fs) bool {
+        return switch (self.*) {
+            .ext4 => |*f| f.needs_recovery,
+            .btrfs => |*f| f.needs_recovery,
+            .iso9660, .fat => false,
         };
     }
 
