@@ -19,6 +19,25 @@ const cc = uefi.cc;
 
 const allocator = uefi.pool_allocator;
 
+/// A failed safety check: say what it was and leave. The firmware can then try
+/// its next boot option, which a hang would not let it do.
+pub const panic = std.debug.FullPanic(crash);
+
+var crashing = false;
+
+fn crash(message: []const u8, address: ?usize) noreturn {
+    @branchHint(.cold);
+    if (!crashing) { // not again if reporting it fails too
+        crashing = true;
+        say("\r\ndklilo: internal error: {s} (at 0x{x})\r\n", .{ message, address orelse @returnAddress() });
+        if (uefi.system_table.boot_services) |bs| {
+            bs.stall(10_000_000) catch {}; // time to read it
+            bs.exit(uefi.handle, .aborted, null) catch {};
+        }
+    }
+    while (true) {}
+}
+
 // ---- console ---------------------------------------------------------------
 
 const UefiConsole = struct {

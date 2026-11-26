@@ -1,6 +1,7 @@
 # dklilo — Specification
 
-Status: **Draft v0.6** (L0-L7 implemented, FAT reader done). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.7** (what is built and tested is in section 9 and 9a; known
+defects are in [docs/bugs](docs/bugs/README.md)). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -183,6 +184,12 @@ ordinary unit tests long before they run on bare metal.
 | `stage2.bin` | 512 KiB | Must fit in the 1 MiB gap after the MBR, or in a BIOS boot partition. |
 | `dklilo<ARCH>.efi` | 512 KiB each | Keeps the ESP footprint small; enforced by a build check. |
 
+Every shipped Zig binary (stage 2, the UEFI loaders and the `dklilo` tool) is
+built `ReleaseSafe`: an index out of bounds or an integer overflow stops with
+a message instead of corrupting memory (the BIOS loader halts; the UEFI
+loader returns to the firmware). At the time of writing the largest loader is
+the RISC-V one, about 475 KiB.
+
 ### 5.2 Configuration file
 
 Syntax follows LILO: `key = value`, one per line; `#` starts a comment;
@@ -226,8 +233,9 @@ has no `initrd`. `PARTUUID=` works without one.
   GPT partition GUID, or MBR disk signature plus partition number. Stage 2
   looks there; if that fails, it searches every partition on the boot disk
   for `/boot/dklilo.conf` and then `/dklilo.conf`.
-- **UEFI:** first `\EFI\dklilo\dklilo.conf` on the ESP, then
-  `/boot/dklilo.conf` on every partition of the boot disk.
+- **UEFI:** first `\EFI\dklilo\dklilo.conf` on any FAT volume of the boot
+  disk, then `/boot/dklilo.conf` and `/dklilo.conf` on every volume of it,
+  then the same on other disks.
 - If no configuration is found, dklilo shows a prompt where a kernel path
   and command line can be typed by hand. A broken config never leaves the
   machine unbootable.
@@ -242,11 +250,16 @@ All readers are read-only and never write to the disk.
 - **ext2/3/4:** block maps and extents, `64bit`, `flex_bg`, inline data,
   and htree directories (read as plain directories, which htree allows).
   `metadata_csum` checksums are verified, and a mismatch is reported rather
-  than silently ignored.
+  than silently ignored (the separate checksums of hashed-directory index
+  blocks are not verified).
+- A volume with an incompatible feature the reader doesn't know is not read.
+  Journals and logs are not replayed; the loaders warn when one is pending.
 - **btrfs:** superblock, the system chunk array and chunk tree, the root
   tree, subvolumes, inline and regular extents, and zlib, LZO and zstd
-  compression. Profiles: single, DUP and RAID1 (reading the first good copy,
-  falling back to the mirror on a checksum error).
+  compression. Profiles: single, DUP and RAID1. A tree block is read from the
+  first copy that passes its checks, falling back to the mirror. File data
+  falls back only when a copy can't be read: data checksums are **not**
+  verified (see 9a).
 - **FAT12/16/32** with long file names: needed for the ESP.
 - **ISO 9660** with Rock Ridge: needed to boot the DKRescue ISO.
 
@@ -267,13 +280,17 @@ All readers are read-only and never write to the disk.
 
 ### 5.6 Booting Windows
 
-- **UEFI:** `other = windows` finds `\EFI\Microsoft\Boot\bootmgfw.efi` on
-  the ESP and starts it. Windows on UEFI machines is always installed this
+- **UEFI:** `other = windows` finds `\EFI\Microsoft\Boot\bootmgfw.efi` and
+  starts it: on the volume dklilo was loaded from, else elsewhere on that
+  disk, else on another. Windows on UEFI machines is always installed this
   way.
-- **BIOS:** `other = windows` finds the first NTFS partition whose boot
-  sector has the NTFS signature and an `NTLDR`/`BOOTMGR` loader, loads that
-  boot sector, and jumps to it. `other = /dev/sda1` style names (resolved by
-  the installer) pick a partition explicitly.
+- **BIOS:** `other = windows` takes an NTFS partition of the boot disk (one
+  whose boot sector has the NTFS signature), preferring the active one; its
+  loader is not looked for. `other = 2` or `other = /dev/sda2` picks a
+  partition **of the boot disk** by number: the disk in a `/dev` name can't
+  be honoured, so the loader says which partition it is starting and
+  `dklilo check` looks for a mismatch. A sector without `0x55AA` is not
+  started.
 
 ### 5.7 The installer (`dklilo`)
 
@@ -339,15 +356,19 @@ deps/
   fsread/          filesystem readers, crc, lzo (a reusable package)
 src/
   common/
-    blockdev.zig  devio.zig  part.zig  volumes.zig  config.zig  menu.zig  console.zig  linux/
+    blockdev.zig  devio.zig  part.zig  volumes.zig  bootrecord.zig
+    config.zig  menu.zig  console.zig  linux/
   bios/
     stage1.zig        MBR code (.code16 asm)
-    realmode.zig      real-mode trampoline and BIOS service wrappers
-    main.zig          stage 2
+    cdstub.zig        El Torito boot sector
+    realmode.zig      entry code and the real-mode trampoline
+    stage2.zig        stage 2
+    console.zig  disk.zig
   uefi/
     main.zig
   installer/
-    main.zig
+    main.zig  plan.zig  genconfig.zig  bootvars.zig  blockinfo.zig
+    mounts.zig  safefile.zig  arch.zig  fat12.zig
 tests/
   images/           scripts that build test disk images with mkfs tools
   qemu/             boot tests under SeaBIOS and OVMF
@@ -359,7 +380,8 @@ tests/
   disk images created by the real `mkfs.ext4`, `mkfs.btrfs` (with each
   compression type) and `mkfs.fat`, and compared file by file with the
   originals.
-- **Fuzzing:** every on-disk parser is fuzzed with Zig's built-in fuzzer.
+- **Fuzzing:** every on-disk parser is fuzzed with Zig's built-in fuzzer
+  (`zig build test --fuzz`; an ordinary run only runs each target once).
   A corrupt disk must produce an error, never a hang or a crash, because a
   rescue disk's boot loader will meet damaged disks.
 - **QEMU boot tests** for every combination of firmware (SeaBIOS, OVMF),

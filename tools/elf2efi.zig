@@ -45,6 +45,14 @@ fn alignUp(v: u64, a: u64) u64 {
     return (v + a - 1) & ~(a - 1);
 }
 
+/// The largest image this converts, in memory.
+const max_image = 64 << 20;
+
+/// Whether `len` bytes at `off` lie within the first `total`.
+fn within(off: u64, len: u64, total: u64) bool {
+    return off <= total and len <= total - off;
+}
+
 const Seg = struct { vaddr: u64, offset: u64, filesz: u64, memsz: u64, flags: u32 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -70,6 +78,12 @@ pub fn main(init: std.process.Init) !u8 {
     const shentsize = rd(u16, elf, 58);
     const shnum = rd(u16, elf, 60);
 
+    if ((phnum > 0 and phentsize < 56) or !within(phoff, @as(u64, phnum) * phentsize, elf.len))
+        return fail("the program headers lie outside the file");
+    if ((shnum > 0 and shentsize < 64) or !within(shoff, @as(u64, shnum) * shentsize, elf.len))
+        return fail("the section headers lie outside the file");
+    if (entry >= max_image) return fail("the entry point is out of range");
+
     var segs: std.ArrayList(Seg) = .empty;
     defer segs.deinit(gpa);
     for (0..phnum) |i| {
@@ -82,6 +96,11 @@ pub fn main(init: std.process.Init) !u8 {
             .filesz = rd(u64, elf, ph + 32),
             .memsz = rd(u64, elf, ph + 40),
         });
+    }
+    for (segs.items) |s| {
+        if (s.filesz > s.memsz or !within(s.offset, s.filesz, elf.len))
+            return fail("a segment's data lies outside the file");
+        if (!within(s.vaddr, s.memsz, max_image)) return fail("a segment lies outside the largest image");
     }
     if (segs.items.len == 0) return fail("no PT_LOAD segments");
     if (segs.items.len > 6) return fail("too many segments");
@@ -102,6 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (rd(u32, elf, sh + 4) != SHT_RELA) continue;
         const off = rd(u64, elf, sh + 24);
         const size = rd(u64, elf, sh + 32);
+        if (!within(off, size, elf.len)) return fail("a relocation section lies outside the file");
         var p: u64 = 0;
         while (p + 24 <= size) : (p += 24) {
             const r_offset = rd(u64, elf, off + p);
@@ -109,8 +129,8 @@ pub fn main(init: std.process.Init) !u8 {
             const addend = rd(i64, elf, off + p + 16);
             if (r_info & 0xFFFF_FFFF != R_RISCV_RELATIVE or r_info >> 32 != 0)
                 return fail("unsupported dynamic relocation (only R_RISCV_RELATIVE is handled)");
+            if (!within(r_offset, 8 + delta, mem.len)) return fail("relocation outside the image");
             const rva = r_offset + delta;
-            if (rva + 8 > mem.len) return fail("relocation outside the image");
             std.mem.writeInt(u64, mem[rva..][0..8], @as(u64, @bitCast(addend)) +% delta, .little);
             try relocs.append(gpa, rva);
         }

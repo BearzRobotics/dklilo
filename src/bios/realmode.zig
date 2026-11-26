@@ -16,8 +16,8 @@
 //!   0x06C00          scratch: E820 / drive-parameter results
 //!   0x06E00          disk address packet
 //!   0x06F00          Regs block
-//!   (0x07C00)        temporary 32-bit stack until `stage2_early` returns
-//!   0x08000-0x87FFF  stage 2 image
+//!   0x08000-0x87FFF  stage 2 image, its .bss, and after that the stack used
+//!                    until `stage2_early` returns (stage2.ld)
 //!   0x88000-0x8FFFF  32 KiB disk bounce buffer
 //!   0x90000          boot_params, 0x91000 kernel command line
 
@@ -197,8 +197,8 @@ comptime {
         \\   mov fs, ax
         \\   mov gs, ax
         \\   mov ss, ax
-        \\   mov esp, 0x7C00        # a temporary stack in low memory, until it
-        \\   call stage2_early      # is known that RAM exists higher up
+        \\   mov esp, offset early_stack_top  # in low memory (stage2.ld), until
+        \\   call stage2_early      # it is known that RAM exists higher up
         \\   mov esp, 0x1F00000     # stack: just below the 32 MiB heap
         \\   call stage2_main
         \\ 1:

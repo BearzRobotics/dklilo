@@ -22,6 +22,12 @@ pub fn build(b: *std.Build) void {
     const dev_step = b.step("dev", "Also install loose boot images and test fixtures");
     dev_step.dependOn(b.getInstallStep());
 
+    // Everything shipped that reads disks, configurations or other untrusted
+    // data keeps its safety checks: an out-of-bounds index or an overflow stops
+    // with a message instead of corrupting memory. (Stage 1 and the CD boot
+    // sector are assembly.)
+    const shipped_mode: std.builtin.OptimizeMode = .ReleaseSafe;
+
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86,
         .os_tag = .freestanding,
@@ -73,7 +79,7 @@ pub fn build(b: *std.Build) void {
                 // No SSE etc.: nothing enables it in our protected-mode setup.
                 .cpu_model = .{ .explicit = &std.Target.x86.cpu.i586 },
             }),
-            .optimize = .ReleaseSmall,
+            .optimize = shipped_mode,
             .single_threaded = true,
             .red_zone = false,
             .stack_protector = false,
@@ -104,7 +110,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/uefi/main.zig"),
                 .target = b.resolveTargetQuery(.{ .cpu_arch = t.arch, .os_tag = .uefi, .abi = .msvc }),
-                .optimize = .ReleaseSmall,
+                .optimize = shipped_mode,
                 .imports = &.{.{ .name = "common", .module = common }},
             }),
         });
@@ -122,7 +128,12 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/uefi/main.zig"),
                 .target = b.resolveTargetQuery(.{ .cpu_arch = .riscv64, .os_tag = .uefi, .abi = .msvc }),
-                .optimize = .ReleaseSmall,
+                .optimize = shipped_mode,
+                // To stay within the size limit: nothing reads unwind tables,
+                // and the debug information is of no use in this image.
+                .strip = true,
+                .unwind_tables = .none,
+                .omit_frame_pointer = true,
                 .pic = true,
                 .imports = &.{.{ .name = "common", .module = common }},
             }),
@@ -165,7 +176,8 @@ pub fn build(b: *std.Build) void {
             .target = b.standardTargetOptions(.{
                 .default_target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none },
             }),
-            .optimize = .ReleaseSmall,
+            .optimize = shipped_mode,
+            .strip = true,
             .imports = &.{.{ .name = "common", .module = common }},
         }),
     });
@@ -185,8 +197,8 @@ pub fn build(b: *std.Build) void {
     size_checks[efi_tags.len] = .{ .name = "stage2.bin", .file = stage2_bin.getOutput() };
     for (size_checks) |item| {
         const check = b.addSystemCommand(&.{
-            "sh",                                                                                 "-c",
-            "[ \"$(stat -c%s \"$1\")\" -le 524288 ] || { echo \"$2 exceeds 512 KiB\"; exit 1; }", "sh",
+            "sh",                                                                               "-c",
+            "[ \"$(wc -c < \"$1\")\" -le 524288 ] || { echo \"$2 exceeds 512 KiB\"; exit 1; }", "sh",
         });
         check.addFileArg(item.file);
         check.addArg(item.name);
@@ -197,13 +209,15 @@ pub fn build(b: *std.Build) void {
     // Images are written to a fixed directory in the build cache so the
     // btrfs tests (128 MiB sparse files) can read them from disk instead of
     // embedding them.
-    const fixtures_dir = ".zig-cache/dklilo-fixtures";
+    // The images are a build output, so they live in the cache like any other
+    // (wherever --cache-dir puts it) and are made again when the script changes.
     const gen = b.addSystemCommand(&.{"sh"});
     gen.addFileArg(b.path("tests/images/make-fixtures.sh"));
-    gen.addArg(fixtures_dir);
+    const fixtures_dir = gen.addOutputDirectoryArg("dklilo-fixtures");
 
+    // The tests run inside that directory, wherever the cache puts it.
     const test_options = b.addOptions();
-    test_options.addOption([]const u8, "fixtures_dir", fixtures_dir);
+    test_options.addOption([]const u8, "fixtures_dir", ".");
 
     const common_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -214,16 +228,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     common_tests.root_module.addOptions("test_options", test_options);
-    common_tests.step.dependOn(&gen.step);
     for ([_][]const u8{
         "manifest.txt", "manifest-fat.txt", "ext4.img", "ext4-1k.img", "ext4-64bit.img", "ext3.img",
         "ext2.img",     "ext4-inline.img",  "mbr.img",  "gpt.img",     "ext4-holes.img", "ext4-holes.bin",
     }) |name| {
-        const path = b.pathJoin(&.{ fixtures_dir, name });
-        common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = b.path(path) });
+        common_tests.root_module.addAnonymousImport(name, .{ .root_source_file = fixtures_dir.path(b, name) });
     }
     const test_step = b.step("test", "Run unit tests against real filesystem images");
-    test_step.dependOn(&b.addRunArtifact(common_tests).step);
+    const run_common = b.addRunArtifact(common_tests);
+    run_common.setCwd(fixtures_dir);
+    test_step.dependOn(&run_common.step);
 
     // The BIOS loader is 32-bit, where `usize` arithmetic on values read from
     // a disk can wrap. Run the same reader tests as a 32-bit program too; an
@@ -240,9 +254,9 @@ pub fn build(b: *std.Build) void {
         });
         tests32.root_module.addOptions("test_options", test_options);
         tests32.root_module.import_table = common_tests.root_module.import_table.clone(b.allocator) catch @panic("OOM");
-        tests32.step.dependOn(&gen.step);
         const run32 = b.addRunArtifact(tests32);
         run32.skip_foreign_checks = true;
+        run32.setCwd(fixtures_dir);
         test_step.dependOn(&run32.step);
     }
 

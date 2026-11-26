@@ -1,16 +1,22 @@
 #!/bin/sh
-# Runs the unit tests and every QEMU boot test. Tests that need a kernel are
-# skipped (exit 77) when none is available; see tests/qemu/make-linux-disk.sh.
+# Runs the unit tests (dklilo's and the fsread package's) and every QEMU boot
+# test. Tests that need a kernel or a tool that isn't there are skipped (exit
+# 77) and listed again at the end; see tests/qemu/make-linux-disk.sh.
 set -u
 cd "$(dirname "$0")/.."
 zig build dev || exit 1
 zig build test || exit 1
-fail=0
+(cd deps/fsread && zig build test) || exit 1
+fail=""
+skip=""
 for t in tests/qemu/l*.sh; do
-    case "$t" in *make-*|*qemu-uefi.sh) continue;; esac
     out=$("$t" 2>&1); rc=$?
-    if [ $rc -eq 77 ]; then echo "SKIP $t"; continue; fi
-    echo "$out" | tail -3
-    [ $rc -eq 0 ] || fail=1
+    case $rc in
+        0) echo "$out" | tail -3 ;;
+        77) echo "SKIP $t"; echo "$out" | grep '^SKIP'; skip="$skip $t" ;;
+        *) echo "---- $t failed (exit $rc) ----"; echo "$out" | tail -40; fail="$fail $t" ;;
+    esac
 done
-exit $fail
+[ -z "$skip" ] || echo "Skipped:$skip"
+if [ -n "$fail" ]; then echo "FAILED:$fail"; exit 1; fi
+echo "All tests that ran passed."

@@ -7,5 +7,5 @@
         // Filesystem readers; kept as a separate package so other projects can use them.
         .fsread = .{ .path = "deps/fsread" },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "deps", "docs/manpages" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "deps", "docs/manpages", "tools", "tests" },
 }

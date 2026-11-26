@@ -7,6 +7,9 @@ SECTIONS {
     __bss_start = .;
     .bss : { *(.bss*) *(COMMON) }
     __bss_end = .;
+    /* The stack until the memory above 1 MiB has been checked. Not part of the
+       image, and not zeroed with .bss: it is in use while that happens. */
+    .early_stack (NOLOAD) : { . = ALIGN(16); . += 0x4000; early_stack_top = .; }
     /* Real-mode code can only address the first 64 KiB: the entry, the
        trampolines and their data (all before realmode_end) must stay below. */
     ASSERT(realmode_end <= 0x10000, "real-mode code and data end above 64 KiB")

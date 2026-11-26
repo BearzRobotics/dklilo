@@ -13,6 +13,8 @@ mkdir -p "$(dirname "$final")"
 out="$(cd "$(dirname "$final")" && pwd)/.$(basename "$final").$$"
 rm -rf "$out"; mkdir -p "$out"
 w=$(mktemp -d); trap 'rm -rf "$w" "$out"' EXIT
+# Interrupted (a build stopped half way) is an exit too: nothing is left over.
+trap 'exit 130' INT TERM HUP
 
 # --- the tree every filesystem image is populated from ----------------------
 t="$w/tree"

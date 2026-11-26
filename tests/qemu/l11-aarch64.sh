@@ -36,7 +36,8 @@ image  = /boot/vmlinuz
     initrd = /boot/initrd2.cpio
 C
 rc=0; ARCH=aa64 "$here/make-linux-disk.sh" "$d/disk.img" "$d/dklilo.conf" || rc=$?
-[ $rc -eq 77 ] && { echo "SKIP: no arm64 kernel for the Linux boot (set DKLILO_KERNEL_AA64)"; exit 0; }
+# 77, not 0: what ran passed, but the script's main check did not run.
+[ $rc -eq 77 ] && { echo "SKIP: no arm64 kernel for the Linux boot (set DKLILO_KERNEL_AA64)"; exit 77; }
 [ $rc -eq 0 ] || exit $rc
 ARCH=aa64 "$here/qemu-uefi.sh" "$d/disk.img" "$d/serial.txt" 180
 ok=1

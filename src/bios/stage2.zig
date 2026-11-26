@@ -17,6 +17,23 @@ comptime {
     _ = rm; // pulls in the entry point and trampoline assembly
 }
 
+/// A failed safety check: say what it was, and stop. Carrying on would mean
+/// working with memory that can no longer be trusted.
+pub const panic = std.debug.FullPanic(crash);
+
+var crashing = false;
+
+fn crash(message: []const u8, address: ?usize) noreturn {
+    @branchHint(.cold);
+    if (!crashing) { // not again if printing it fails too
+        crashing = true;
+        con.puts("\r\ndklilo: internal error: ");
+        con.puts(message);
+        say(" (at 0x{x}). Halted.\r\n", .{address orelse @returnAddress()});
+    }
+    halt();
+}
+
 // Memory layout above 1 MiB (see realmode.zig for the low-memory map):
 //   0x0100000  kernel (protected-mode part)
 //   0x1E00000  stack (grows down from 0x1F00000)
@@ -334,7 +351,7 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
     }
 }
 
-/// Runs first, on a small stack in low memory: the real stack and the heap are
+/// Runs first, on a stack in low memory: the real stack and the heap are
 /// at fixed addresses that a machine with little RAM doesn't have.
 export fn stage2_early() callconv(.c) void {
     clearBss();
