@@ -380,5 +380,5 @@ Source code and issue tracker: <https://github.com/BearzRobotics/dklilo>
 
 # VERSION
 
-This manual describes dklilo version 0.0.4.
+This manual describes dklilo version 0.0.5.
 
