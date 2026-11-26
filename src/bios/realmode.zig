@@ -96,16 +96,90 @@ comptime {
         \\   .byte 0xEB, 0x08       # jmp over the signature below; the installer
         \\   .ascii "DKLILOS2"      # recognises an installed stage 2 by it
         \\   cli
+        \\   cld                    # the code Zig generates assumes DF = 0
         \\   xor ax, ax
         \\   mov ds, ax
         \\   mov es, ax
         \\   mov ss, ax
         \\   mov sp, 0x7C00
         \\   mov [boot_drive], dl   # stage 1 passed the boot drive in dl
+        \\
+        \\   # A20: without it, addresses above 1 MiB wrap round to below. Try the
+        \\   # ways to open it from the gentlest, testing after each.
+        \\   call a20_check
+        \\   jnz a20_done           # already open: touch nothing
+        \\   mov ax, 0x2401         # ask the BIOS
+        \\   sti
+        \\   int 0x15
+        \\   cli
+        \\   cld
+        \\   xor ax, ax
+        \\   mov ds, ax
+        \\   mov es, ax
+        \\   call a20_wait
+        \\   jnz a20_done
+        \\   call kbc_ready         # the keyboard controller: write its output
+        \\   mov al, 0xD1           # port, with A20 on
+        \\   out 0x64, al
+        \\   call kbc_ready
+        \\   mov al, 0xDF
+        \\   out 0x60, al
+        \\   call kbc_ready
+        \\   call a20_wait
+        \\   jnz a20_done
         \\   in al, 0x92            # "fast A20": bit 1 of system control port A
         \\   or al, 2               # (bit 0 is the reset line; keep it clear)
         \\   and al, 0xFE
         \\   out 0x92, al
+        \\   call a20_wait
+        \\   jnz a20_done
+        \\   mov si, offset a20_message
+        \\ a20_fail_print:
+        \\   lodsb
+        \\   test al, al
+        \\   jz a20_fail_stop
+        \\   mov ah, 0x0E
+        \\   xor bx, bx
+        \\   int 0x10
+        \\   jmp a20_fail_print
+        \\ a20_fail_stop:
+        \\   hlt
+        \\   jmp a20_fail_stop
+        \\ a20_message: .asciz "dklilo: cannot enable A20"
+        \\
+        \\ # ZF = 0 if A20 is open: then FFFF:0510 (0x100500) is not 0000:0500.
+        \\ a20_check:
+        \\   push es
+        \\   mov ax, 0xFFFF
+        \\   mov es, ax
+        \\   mov bl, [0x500]
+        \\   mov bh, es:[0x510]
+        \\   mov byte ptr [0x500], 0x00
+        \\   mov byte ptr es:[0x510], 0xFF
+        \\   mov al, [0x500]
+        \\   mov es:[0x510], bh
+        \\   mov [0x500], bl
+        \\   pop es
+        \\   cmp al, 0xFF           # ZF = 1: the write came round, A20 is shut
+        \\   ret
+        \\ a20_wait:                # a gate may take a while to open
+        \\   mov cx, 0xFFFF
+        \\ a20_wait_again:
+        \\   call a20_check
+        \\   jnz a20_wait_over
+        \\   loop a20_wait_again
+        \\ a20_wait_over:
+        \\   ret
+        \\ kbc_ready:               # wait (a while) for its input buffer to empty
+        \\   mov cx, 0xFFFF
+        \\ kbc_wait:
+        \\   in al, 0x64
+        \\   test al, 2
+        \\   jz kbc_done
+        \\   loop kbc_wait
+        \\ kbc_done:
+        \\   ret
+        \\ a20_done:
         \\   lgdt [gdtr]
         \\   mov eax, cr0
         \\   or al, 1               # PE: enter protected mode
@@ -206,6 +280,7 @@ comptime {
         \\   mov gs, ax
         \\   mov ss, ax
         \\   mov esp, [saved_esp]
+        \\   cld                    # a BIOS may leave DF set (it was saved above)
         \\   pop edi
         \\   pop esi
         \\   pop ebx
@@ -282,5 +357,7 @@ comptime {
         \\ rm_idtr:
         \\   .word 0x3FF
         \\   .long 0
+        \\ .global realmode_end     # the linker script checks where this lands
+        \\ realmode_end:
     );
 }

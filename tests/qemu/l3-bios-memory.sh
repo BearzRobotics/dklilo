@@ -56,5 +56,10 @@ disk hungry --init-size-mib 200
 boot "a kernel with room to decompress boots" hungry 256 "Starting kernel"
 boot "a kernel without room to decompress is refused" hungry 64 "not enough memory" "Boot failed"
 
+# A kernel that wants to run high must find memory there (docs/bugs BIOS-04).
+disk high --pref-mib 200 --init-size-mib 8
+boot "a kernel preferring a high address boots with RAM there" high 256 "Starting kernel"
+boot "and is refused without it" high 64 "not enough memory" "Boot failed"
+
 [ $failures -eq 0 ] || { echo "FAIL: $failures memory case(s)"; exit 1; }
 echo "PASS: the BIOS loader checks that everything fits in memory"

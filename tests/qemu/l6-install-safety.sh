@@ -122,5 +122,46 @@ else echo "ok: refuses to replace a foreign fallback loader"; fi
 if usb --force && cmp -s "$d/esp/$loader" "$d/ours.efi"; then echo "ok: --force replaces it"
 else bad "--force did not replace the loader: $(cat "$d/out.txt")"; fi
 
+# ---- a BIOS boot partition further in than the usual 1 MiB (INST-09) -------
+rm -f "$d/far.img"; truncate -s 40M "$d/far.img"
+printf 'label: gpt\nstart=2048, size=40000, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4\nstart=43008, size=2048, type=21686148-6449-6E6F-744E-656564454649\n' |
+    sfdisk -q "$d/far.img"
+accepts "a BIOS boot partition 21 MiB into the disk" "$d/far.img"
+[ "$(od -An -tu4 -j416 -N4 "$d/far.img" | tr -d ' ')" = 43008 ] || bad "stage 2 is not recorded in that partition"
+put "$d/far.img" $((43100 * 512)) 'x'
+dd if=/dev/zero of="$d/far.img" bs=1 count=440 conv=notrunc 2>/dev/null
+put "$d/far.img" $((43008 * 512)) 'SOMEONE-ELSES-DATA'
+refuses "foreign data in that partition" "$d/far.img"
+
+# ---- messages and arguments (INST-16) --------------------------------------
+new_disk "$d/disk.img"
+# Someone else's boot code that starts the way much boot code does.
+put "$d/disk.img" 0 '\372\061\300\216\330THIS IS ANOTHER LOADER'
+accepts "a disk with another system's boot code" "$d/disk.img"
+grep -q "boot code will be replaced" "$d/out.txt" || bad "replacing foreign boot code was not announced"
+rc=0; "$dk" install-bios --force-it --yes > "$d/out.txt" 2>&1 || rc=$?
+if [ $rc -eq 2 ]; then echo "ok: an unknown option is a usage error"; else bad "unknown option: exit $rc: $(cat "$d/out.txt")"; fi
+
+# ---- an ESP that isn't mounted (INST-04) ------------------------------------
+# /boot/efi is then a directory of the root filesystem.
+mkdir -p "$d/root/boot/efi"
+printf '30 1 8:2 / / rw - ext4 /dev/sda2 rw\n' > "$d/mounts"
+if "$dk" install-uefi "$d/root/boot/efi" --arch x64 --entry-file "$d/entry.bin" --yes --mountinfo "$d/mounts" > "$d/out.txt" 2>&1; then
+    bad "installed to the root filesystem in place of the ESP"
+elif ! grep -q "not on a FAT partition" "$d/out.txt"; then bad "unmounted ESP: $(tail -3 "$d/out.txt")"
+elif [ -e "$d/root/boot/efi/EFI" ] || [ -e "$d/entry.bin" ]; then bad "refused, but wrote something"
+else echo "ok: refuses an ESP that isn't mounted"; fi
+
+# ---- a loader that can't be written completely (INST-07) --------------------
+mkdir -p "$d/full/EFI/dklilo"
+"$dk" install-uefi "$d/full" --arch x64 --removable --yes >/dev/null
+cp "$d/full/$loader" "$d/before.efi"
+# A file size limit makes the write fail part way, as a full ESP would.
+if (trap '' XFSZ; ulimit -f 40; "$dk" install-uefi "$d/full" --arch x64 --removable --yes > "$d/out.txt" 2>&1); then
+    bad "a failed loader write was reported as success"
+elif ! cmp -s "$d/full/$loader" "$d/before.efi"; then bad "a failed write left a broken loader"
+else echo "ok: a failed write leaves the old loader in place"; fi
+[ "$(ls "$d/full/EFI/BOOT" | wc -l)" -eq 1 ] || bad "a temporary file was left behind"
+
 [ $failures -eq 0 ] || { echo "FAIL: $failures installer safety case(s)"; exit 1; }
 echo "PASS: the installer refuses unsafe targets and accepts safe ones"

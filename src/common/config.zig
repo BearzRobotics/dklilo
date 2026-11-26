@@ -26,6 +26,23 @@ pub const Error = error{
 pub const Diagnostic = struct {
     /// 1-based line number of the problem (0 when it isn't about one line).
     line: usize = 0,
+    /// Things that are accepted but probably not meant, for `dklilo check`:
+    /// the loader ignores them, so that they never stop a boot.
+    warnings: [8]Warning = undefined,
+    warning_count: usize = 0,
+
+    pub const Warning = struct { line: usize, key: []const u8, kind: enum { repeated, ignored_value } };
+
+    fn warn(self: ?*Diagnostic, w: Warning) void {
+        const d = self orelse return;
+        if (d.warning_count == d.warnings.len) return;
+        d.warnings[d.warning_count] = w;
+        d.warning_count += 1;
+    }
+
+    pub fn warningSlice(self: *const Diagnostic) []const Warning {
+        return self.warnings[0..self.warning_count];
+    }
 };
 
 pub const EntryKind = enum { linux, chain };
@@ -74,6 +91,16 @@ pub const Config = struct {
         return 0;
     }
 
+    /// Whether `password` is 64 hex digits. The parser only checks the
+    /// length: a loader that rejected such a file would drop to the manual
+    /// prompt with no password at all, whereas one that can never be matched
+    /// keeps everything it guards locked. `dklilo check` reports it.
+    pub fn passwordUsable(self: *const Config) bool {
+        const p = self.password orelse return true;
+        for (p) |c| if (!std.ascii.isHex(c)) return false;
+        return true;
+    }
+
     pub fn find(self: *const Config, label: []const u8) ?usize {
         for (self.entries, 0..) |e, i| if (std.mem.eql(u8, e.label, label)) return i;
         return null;
@@ -106,19 +133,39 @@ fn parseNum(comptime T: type, s: []const u8) Error!T {
     return std.fmt.parseInt(T, s, 10) catch error.Syntax;
 }
 
+/// Whether a flag written as `key` or `key = value` is on: it is, unless the
+/// value says no. (It used to be on whatever the value said.)
+fn flag(diag: ?*Diagnostic, line: usize, key: []const u8, value: []const u8) bool {
+    for ([_][]const u8{ "no", "false", "off", "0" }) |no| {
+        if (std.ascii.eqlIgnoreCase(value, no)) return false;
+    }
+    const known = value.len == 0 or for ([_][]const u8{ "yes", "true", "on", "1" }) |yes| {
+        if (std.ascii.eqlIgnoreCase(value, yes)) break true;
+    } else false;
+    if (!known) Diagnostic.warn(diag, .{ .line = line, .key = key, .kind = .ignored_value });
+    return true;
+}
+
+/// Keys that may be given once, globally or once per entry.
+const single_keys = [_][]const u8{ "timeout", "default", "password", "serial", "label", "root", "append", "subvol", "iso" };
+
 /// Parses `text`. On error, `diag` (if given) gets the offending line.
 pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic) Error!Config {
     var cfg = Config{ .allocator = allocator };
     errdefer cfg.deinit();
 
     var entries: std.ArrayList(Entry) = .empty;
-    errdefer entries.deinit(allocator);
+    errdefer {
+        for (entries.items) |e| allocator.free(e.initrds);
+        entries.deinit(allocator);
+    }
     var initrds: std.ArrayList([]const u8) = .empty;
     defer initrds.deinit(allocator);
-    var have_label = false;
 
+    var seen: u32 = 0; // `single_keys` already given in this part of the file
     var line_no: usize = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
+    const body = if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text[3..] else text;
+    var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line_raw| {
         line_no += 1;
         errdefer if (diag) |d| {
@@ -132,17 +179,24 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
         const value = if (eq) |i| try cleanValue(line[i + 1 ..]) else "";
         const has_value = eq != null;
 
-        // Boolean keys take no value.
+        // Flags need no value.
         if (std.mem.eql(u8, key, "prompt")) {
-            cfg.prompt = true;
+            cfg.prompt = flag(diag, line_no, key, value);
             continue;
         }
         if (std.mem.eql(u8, key, "restricted")) {
             if (entries.items.len == 0) return error.MisplacedKey;
-            entries.items[entries.items.len - 1].restricted = true;
+            entries.items[entries.items.len - 1].restricted = flag(diag, line_no, key, value);
             continue;
         }
         if (!has_value) return error.Syntax;
+
+        for (single_keys, 0..) |name, bit| {
+            if (!std.mem.eql(u8, key, name)) continue;
+            const mask = @as(u32, 1) << @intCast(bit);
+            if (seen & mask != 0) Diagnostic.warn(diag, .{ .line = line_no, .key = key, .kind = .repeated });
+            seen |= mask;
+        }
 
         if (std.mem.eql(u8, key, "image") or std.mem.eql(u8, key, "other")) {
             if (value.len == 0) return error.MissingValue;
@@ -154,7 +208,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
                 .label = if (kind == .linux) std.fs.path.basename(value) else value,
                 .line = line_no,
             });
-            have_label = false;
+            seen = 0;
             continue;
         }
 
@@ -171,6 +225,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
                 var it = std.mem.splitScalar(u8, value, ',');
                 const port = try parseNum(u8, trim(it.next().?));
                 const baud = if (it.next()) |b| try parseNum(u32, trim(b)) else 9600;
+                if (it.next() != null) Diagnostic.warn(diag, .{ .line = line_no, .key = key, .kind = .ignored_value });
                 if (baud == 0 or baud > 115200) return error.Syntax;
                 cfg.serial = .{ .port = port, .baud = baud };
             } else if (isEntryKey(key)) {
@@ -183,7 +238,6 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
         if (std.mem.eql(u8, key, "label")) {
             if (value.len == 0) return error.MissingValue;
             e.label = value;
-            have_label = true;
         } else if (std.mem.eql(u8, key, "root")) {
             if (e.kind != .linux) return error.MisplacedKey;
             e.root = value;
@@ -197,7 +251,8 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
             if (e.kind != .linux) return error.MisplacedKey;
             e.subvol = value;
         } else if (std.mem.eql(u8, key, "iso")) {
-            if (e.kind != .linux or value.len == 0) return error.MisplacedKey;
+            if (e.kind != .linux) return error.MisplacedKey;
+            if (value.len == 0) return error.MissingValue;
             e.iso = value;
         } else if (isGlobalKey(key)) {
             return error.MisplacedKey;
@@ -243,6 +298,26 @@ fn isGlobalKey(k: []const u8) bool {
         if (std.mem.eql(u8, k, n)) return true;
     }
     return false;
+}
+
+/// A partition of the boot disk, as an `other =` target may name one.
+pub const ChainPartition = struct {
+    number: u8,
+    /// Given as a device name, such as `/dev/sda2`. The BIOS loader can't tell
+    /// which disk that means: only the number counts.
+    device_name: bool,
+};
+
+/// Reads an `other =` target that selects a partition: a number, or a name
+/// under `/dev/` ending in one. Null for anything else.
+pub fn chainPartition(target: []const u8) ?ChainPartition {
+    var start = target.len;
+    while (start > 0 and std.ascii.isDigit(target[start - 1])) start -= 1;
+    const device_name = std.mem.startsWith(u8, target, "/dev/");
+    if (start != 0 and !device_name) return null;
+    const number = std.fmt.parseInt(u8, target[start..], 10) catch return null;
+    if (number == 0) return null;
+    return .{ .number = number, .device_name = device_name };
 }
 
 /// The path part of a config path spec: `LABEL=x:/boot/k` -> `/boot/k`;
@@ -349,4 +424,49 @@ test "password must be a 64-digit hash" {
     var c = try parse(testing.allocator, "password = " ++ hash ++ "\nimage = /k\nrestricted\n", null);
     defer c.deinit();
     try testing.expect(c.entries[0].restricted);
+    try testing.expect(c.passwordUsable());
+    var odd = try parse(testing.allocator, "password = " ++ @as([64]u8, @splat('z')) ++ "\nimage = /k\n", null);
+    defer odd.deinit();
+    try testing.expect(!odd.passwordUsable());
+}
+
+test "a failed parse frees what it had built" {
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "image = /a\ninitrd = /b\nimage = /c\nbogus = 1\n", null));
+}
+
+test "a flag set to no is off; a byte order mark is ignored" {
+    for ([_][]const u8{ "no", "false", "off", "0" }) |no| {
+        var buf: [128]u8 = undefined;
+        var c = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "prompt = {s}\nimage = /k\nrestricted = {s}\n", .{ no, no }), null);
+        defer c.deinit();
+        try testing.expect(!c.prompt);
+        try testing.expect(!c.entries[0].restricted);
+    }
+    var c = try parse(testing.allocator, "prompt\nimage = /k\nrestricted = yes\n", null);
+    defer c.deinit();
+    try testing.expect(c.prompt and c.entries[0].restricted);
+    var bom = try parse(testing.allocator, "\xEF\xBB\xBFtimeout = 5\n", null);
+    defer bom.deinit();
+    try testing.expectEqual(@as(?u32, 5), bom.timeout);
+    try testing.expectError(error.MissingValue, parse(testing.allocator, "image = /k\niso =\n", null));
+}
+
+test "repeated keys and ignored values are noted, not refused" {
+    var d = Diagnostic{};
+    var c = try parse(testing.allocator, "timeout = 1\ntimeout = 2\nserial = 0,9600,8n1\nimage = /k\nlabel = a\nimage = /l\nlabel = b\nroot = x\nroot = y\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(?u32, 2), c.timeout);
+    const w = d.warningSlice();
+    try testing.expectEqual(@as(usize, 3), w.len);
+    try testing.expectEqual(@as(usize, 2), w[0].line);
+    try testing.expectEqualStrings("serial", w[1].key);
+    try testing.expectEqualStrings("root", w[2].key);
+}
+
+test "chainPartition takes numbers and /dev names, nothing else" {
+    try testing.expectEqual(ChainPartition{ .number = 2, .device_name = false }, chainPartition("2").?);
+    try testing.expectEqual(ChainPartition{ .number = 12, .device_name = true }, chainPartition("/dev/nvme0n1p12").?);
+    for ([_][]const u8{ "windows", "disk2", "/EFI/tools/backup2", "/dev/sda", "0", "", "999" }) |t| {
+        try testing.expect(chainPartition(t) == null);
+    }
 }

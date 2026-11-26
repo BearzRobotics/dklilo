@@ -14,7 +14,7 @@ dklilo - install and check the dklilo boot loader
 
 **dklilo mkiso-images** *dir* [**--arch** *ARCH*]
 
-**dklilo isohybrid** *iso*
+**dklilo isohybrid** *iso* [**--yes**]
 
 # DESCRIPTION
 
@@ -34,31 +34,41 @@ reinstall. The commands below are needed only to install the loader, to
 
 generate and check a configuration, and to build bootable ISO images.
 
-Every command that writes to a disk or to the EFI System Partition lists the
+**install-bios** and **install-uefi**, which write to a disk or to the EFI
 
-writes first and asks for confirmation (see **--yes**).
+System Partition, list the writes first and ask for confirmation (see
+
+**--yes**). So does **isohybrid** when it is given a disk rather than a file.
 
 # COMMANDS
 
 **check** [*conf*] [**--device** *DEV*]
-:   Parses a configuration and confirms that every `image` and `initrd` exists,
-    using the same filesystem and parser code as the boot loader. `iso`
-    entries are mounted and checked inside the ISO. Chainload (`other`)
-    entries are listed but not verified. A `root=LABEL=` or `root=UUID=`
-    on an entry without `initrd` produces a warning, since the kernel cannot
-    resolve it by itself.
+:   Parses a configuration and confirms that every `image` and `initrd` is a
+    file that exists, using the same filesystem and parser code as the boot
+    loader. `iso` entries are mounted and checked inside the ISO. Chainload
+    (`other`) entries are listed but not verified. An empty kernel is an
+    error; an empty initramfs, or a kernel that is neither a bzImage nor an
+    EFI program, is a warning. It also fails on a password no one could type
+    and a command line too long for the loader, and warns about passwords
+    that protect less than they seem to, repeated keys, and a `root=LABEL=`
+    or `root=UUID=` on an entry without `initrd`. A configuration with no
+    entries is accepted.
 
     Without **--device**, *conf* (default `/boot/dklilo.conf`) is a file on the
     running system, and the device holding it is found from
-    `/proc/self/mountinfo`. With **--device**, the configuration is searched
-    for on that disk the way the boot loader searches (see FILES in
-    **dklilo.conf**(5)) and *conf* is not used.
+    `/proc/self/mountinfo`. `LABEL=`, `UUID=` and `PARTUUID=` are looked for on
+    the other disks too, as far as permissions allow. The filesystem is read
+    from the device beneath its mount, after a sync; on a journaling
+    filesystem a very recent change may still not be seen. With **--device**,
+    the configuration is searched for on that disk the way the boot loader
+    searches (see FILES in **dklilo.conf**(5)), only that disk is read, and
+    *conf* is not used.
 
 **install-bios** *disk* [**--force**] [**--yes**]
 :   Installs stage 1 into the MBR boot code of *disk* and stage 2 into the gap
     before the first partition (MBR) or into the BIOS boot partition, type
-    EF02 (GPT). The partition table is preserved. It refuses to run if *disk*
-    is a partition, if its first sector is a FAT, NTFS or exFAT boot sector,
+    EF02 (GPT), wherever that is. The partition table is preserved. It refuses
+    to run if *disk* has sectors other than 512 bytes, is a partition, if its first sector is a FAT, NTFS or exFAT boot sector,
     if there is no partition table, or it is empty or has an invalid status
     byte, if a GPT disk has no BIOS boot partition, if there is not enough
     room, or if the space for stage 2 holds anything other than zeros or an
@@ -78,7 +88,13 @@ writes first and asks for confirmation (see **--yes**).
     entry and puts it first in BootOrder through efivarfs
     (`/sys/firmware/efi/efivars`). With **--removable**, an existing file at
     that path is replaced only if it is a dklilo loader (of any version);
-    anything else needs **--force**.
+    anything else needs **--force**. The new loader is written beside the old
+    one, synced and renamed over it, so a failure leaves the old one.
+
+    Without **--removable** and **--device**, *esp-dir* must be on a mounted
+    FAT filesystem: otherwise the ESP is probably not mounted. The partition
+    may be named by any link to it, such as one in `/dev/disk/by-id`. A
+    warning is printed if its type is not EFI System Partition.
 
     A boot entry named "dklilo" for the same partition and loader path is
     updated; otherwise the lowest unused number is taken. If an existing boot
@@ -86,25 +102,34 @@ writes first and asks for confirmation (see **--yes**).
 
 **config** [**--boot** *DIR*] [**-o** *FILE*] [**--force**] [**--root** *DEV*] [**--append** *STR*] [**--no-windows**]
 :   Generates a first `dklilo.conf`. It lists the kernels (`vmlinuz*`) in
-    *DIR*, names the root by PARTUUID when it can, and adds a Windows entry
-    when it finds Windows Boot Manager. For btrfs it adds `subvol=` and
-    `rootflags=subvol=` as needed. The result is parsed with the loader's own
-    parser before it is written.
+    *DIR*, newest first, each with its initramfs, preceded by `amd-ucode.img`
+    and `intel-ucode.img` where present. Paths are written relative to the
+    filesystem (or btrfs subvolume) that holds *DIR*, where the configuration
+    belongs. It names the root by PARTUUID when it can: the filesystem
+    mounted at `/`, or, if *DIR* is the `boot` directory of a system mounted
+    elsewhere, that system's. It adds a Windows entry when it finds Windows:
+    Windows Boot Manager, or on a machine started by BIOS an NTFS boot sector.
+    For btrfs it adds `subvol=` and `rootflags=subvol=` as needed. The result
+    is parsed with the loader's own parser before it is written. **-o** never
+    leaves a partly written file.
 
 **mkiso-images** *dir* [**--arch** *ARCH*]
 :   Writes `eltorito.bin`, `efiboot.img` and `mbr.bin` into the existing
     directory *dir*: the pieces **xorriso**(1) needs for a hybrid BIOS and
     UEFI ISO.
 
-**isohybrid** *iso*
+**isohybrid** *iso* [**--yes**]
 :   After **xorriso** has built the ISO, points stage 1 in its system area at
     stage 2 so the ISO also boots from a USB stick under BIOS. Only the
-    10-byte block list in the ISO is rewritten.
+    10-byte block list in the ISO is rewritten, with the length of the stage 2
+    in that ISO. It refuses an ISO whose system area does not hold dklilo's
+    stage 1.
 
 # OPTIONS
 
 **--yes**
-:   Do not ask for confirmation (**install-bios**, **install-uefi**). Without
+:   Do not ask for confirmation (**install-bios**, **install-uefi**,
+    **isohybrid** on a disk). Without
     it, the command prints what it will write and waits for `yes` on standard
     input. Anything else aborts with nothing written.
 
@@ -242,6 +267,16 @@ Build a hybrid BIOS and UEFI ISO (kernel and `dklilo.conf` go in `tree/`):
 
 `dklilo: cannot tell which partition DIR is on; pass --device /dev/...`
 :   **install-uefi** could not map the ESP to a partition. Use **--device**.
+
+`dklilo: DIR is on a TYPE filesystem mounted at PATH, not on a FAT partition.`
+:   **install-uefi** found no EFI System Partition at *esp-dir*. Mount it, or
+    name the partition with **--device**. Nothing was written.
+
+`dklilo: cannot write PATH: ERROR`
+:   The loader could not be written completely; any earlier one is unchanged.
+
+`dklilo: PATH is written, but may not have reached the disk`
+:   The sync failed. Do not rely on the new loader.
 
 `dklilo: the loader is installed, but creating the boot entry failed`
 :   The file was copied but efivarfs could not be written. Mount efivarfs, or

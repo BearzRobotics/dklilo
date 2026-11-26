@@ -16,6 +16,8 @@ pub const Error = error{
     NoSuchVolume,
     /// The volume has no filesystem dklilo can read.
     NoFilesystem,
+    /// A device node, FIFO, socket or dangling symlink.
+    NotRegularFile,
 } || fs_mod.Error;
 
 pub const Volume = struct {
@@ -36,6 +38,9 @@ pub const Volume = struct {
     bootable: bool = false,
     state: enum { unprobed, open, none } = .unprobed,
     fs: fs_mod.Fs = undefined,
+    /// Why the last look for a filesystem failed, when it was more than there
+    /// being none: damage, an unsupported feature, a read error.
+    probe_error: ?fs_mod.Error = null,
 
     /// Does the volume start with an NTFS boot sector ("NTFS    " OEM id and
     /// the 0x55AA signature)?
@@ -54,9 +59,16 @@ pub const Volume = struct {
                 if (fs_mod.Fs.open(allocator, devio.fromRegion(self.dev, self.region))) |fs| {
                     self.fs = fs;
                     self.state = .open;
+                    self.probe_error = null;
                     return &self.fs;
-                } else |_| {
-                    self.state = .none;
+                } else |e| {
+                    switch (e) {
+                        // These may not happen again: look again next time.
+                        error.IoError, error.OutOfMemory => {},
+                        else => self.state = .none,
+                    }
+                    // Too small, or simply not a filesystem: nothing to report.
+                    if (e != error.BadMagic and e != error.OutOfRange) self.probe_error = e;
                     return null;
                 }
             },
@@ -90,6 +102,8 @@ const FileDev = struct {
 
 /// A mounted loopback image: the file, and a volume over it.
 const Mount = struct {
+    /// The volume `spec` was looked up from.
+    base: *const Volume,
     spec: []u8,
     subvol: ?[]u8,
     dev: FileDev,
@@ -128,13 +142,19 @@ pub const Set = struct {
     /// one whole-disk volume (CD images, "superfloppies"). Returns the disk's
     /// index.
     pub fn addDisk(self: *Set, disk_dev: blockdev.BlockDev) std.mem.Allocator.Error!usize {
-        const dp = try self.allocator.create(blockdev.BlockDev);
-        errdefer self.allocator.destroy(dp);
-        dp.* = disk_dev;
-        try self.devs.append(self.allocator, dp);
+        const dp = blk: {
+            const new = try self.allocator.create(blockdev.BlockDev);
+            // Only until `devs` holds it; `deinit` frees it from then on.
+            errdefer self.allocator.destroy(new);
+            new.* = disk_dev;
+            try self.devs.append(self.allocator, new);
+            break :blk new;
+        };
         const dev = dp.*;
         const disk = self.disks;
         self.disks += 1;
+        // A size in bytes that doesn't fit 64 bits is not a real disk.
+        _ = std.math.mul(u64, dev.sector_count, dev.sector_size) catch return disk;
         // An ISO 9660 volume (a DVD, or a hybrid ISO written to a stick) is
         // the whole device. On optical media (2048-byte sectors) that is all
         // there is; on a hybrid disk the partitions follow below.
@@ -143,11 +163,15 @@ pub const Set = struct {
             if (dev.sector_size >= 2048) return disk;
         }
         const table = part.read(dev) catch {
-            if (self.vols.items.len > 0 and self.vols.items[self.vols.items.len - 1].disk == disk) return disk;
-            try self.vols.append(self.allocator, .{ .region = dev.whole(), .dev = dp, .disk = disk, .number = 0 });
+            try self.addWholeDisk(dp, disk);
             return disk;
         };
-        for (table.slice()) |p| {
+        for (table.slice()) |listed| {
+            // Nothing outside the disk can be read: drop a partition that
+            // starts there and cut one that runs past the end.
+            if (listed.start_lba >= dev.sector_count) continue;
+            var p = listed;
+            p.sector_count = @min(p.sector_count, dev.sector_count - p.start_lba);
             // The extended container itself holds no filesystem.
             if (table.kind == .mbr and (p.mbr_type == 0x05 or p.mbr_type == 0x0F or p.mbr_type == 0x85)) continue;
             try self.vols.append(self.allocator, .{
@@ -161,7 +185,15 @@ pub const Set = struct {
                 .bootable = p.bootable,
             });
         }
+        // An empty table may be leftover boot code in front of a filesystem.
+        try self.addWholeDisk(dp, disk);
         return disk;
+    }
+
+    /// Adds the whole of `disk` as a volume, if it has no volume yet.
+    fn addWholeDisk(self: *Set, dp: *const blockdev.BlockDev, disk: usize) std.mem.Allocator.Error!void {
+        if (self.vols.items.len > 0 and self.vols.items[self.vols.items.len - 1].disk == disk) return;
+        try self.vols.append(self.allocator, .{ .region = dp.whole(), .dev = dp, .disk = disk, .number = 0 });
     }
 
     pub const Located = struct { vol: *Volume, path: []const u8 };
@@ -175,7 +207,14 @@ pub const Set = struct {
                 const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return error.NoSuchVolume;
                 const value = rest[0..colon];
                 const path = rest[colon + 1 ..];
-                for (self.vols.items) |*v| if (self.matches(v, pre, value)) return .{ .vol = v, .path = path };
+                // The disk of `default` first: a cloned disk or a stick with
+                // the same names must not take over.
+                for ([_]bool{ true, false }) |same_disk| {
+                    for (self.vols.items) |*v| {
+                        if ((v.disk == default.disk) != same_disk) continue;
+                        if (self.matches(v, pre, value)) return .{ .vol = v, .path = path };
+                    }
+                }
                 return error.NoSuchVolume;
             }
         }
@@ -198,6 +237,8 @@ pub const Set = struct {
         }
         const fs = v.filesystem(self.allocator) orelse return false;
         if (std.mem.eql(u8, prefix, "LABEL=")) return std.mem.eql(u8, fs.label(), value);
+        // ISO 9660 has no UUID and FAT only a short serial number.
+        if (fs.* != .ext4 and fs.* != .btrfs) return false;
         var s: [36]u8 = undefined;
         formatUuid(fs.uuid(), &s);
         return std.ascii.eqlIgnoreCase(&s, value);
@@ -252,21 +293,20 @@ pub const Set = struct {
     pub fn isoVolume(self: *Set, default: *Volume, spec: []const u8, subvol: ?[]const u8) Error!*Volume {
         for (self.mounts.items) |m| {
             const same_sub = if (m.subvol) |a| (subvol != null and std.mem.eql(u8, a, subvol.?)) else subvol == null;
-            if (same_sub and std.mem.eql(u8, m.spec, spec)) return &m.vol;
+            if (m.base == default and same_sub and std.mem.eql(u8, m.spec, spec)) return &m.vol;
         }
         const o = try self.openFile(default, spec, subvol);
         const m = try self.allocator.create(Mount);
         errdefer self.allocator.destroy(m);
+        m.base = default;
         m.spec = try self.allocator.dupe(u8, spec);
         errdefer self.allocator.free(m.spec);
         m.subvol = if (subvol) |sv| try self.allocator.dupe(u8, sv) else null;
+        errdefer if (m.subvol) |sv| self.allocator.free(sv);
         m.dev = .{ .fs = o.fs, .file = o.file };
         m.bd = m.dev.blockDev();
         m.vol = .{ .region = m.bd.whole(), .dev = &m.bd, .disk = std.math.maxInt(usize), .number = 0 };
-        if (!iso9660.isIso(devio.fromRegion(&m.bd, m.bd.whole()))) {
-            if (m.subvol) |sv| self.allocator.free(sv);
-            return error.NoFilesystem;
-        }
+        if (!iso9660.isIso(devio.fromRegion(&m.bd, m.bd.whole()))) return error.NoFilesystem;
         try self.mounts.append(self.allocator, m);
         return &m.vol;
     }
@@ -282,6 +322,7 @@ pub const Set = struct {
         try fs.selectSubvolume(subvol);
         const file = try fs.lookup(at.path);
         if (file.is_dir) return error.IsDirectory;
+        if (!file.is_regular) return error.NotRegularFile;
         return .{ .fs = fs, .file = file };
     }
 

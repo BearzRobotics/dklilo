@@ -231,6 +231,9 @@ has no `initrd`. `PARTUUID=` works without one.
 - If no configuration is found, dklilo shows a prompt where a kernel path
   and command line can be typed by hand. A broken config never leaves the
   machine unbootable.
+- Once a boot fails or returns, the menu is shown and nothing boots until a
+  key says so. From the menu, `m` opens the same prompt for booting by hand;
+  it needs the password if one is configured.
 
 ### 5.4 Filesystems
 

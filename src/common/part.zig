@@ -111,10 +111,14 @@ fn readStruct(comptime T: type, bytes: []const u8) T {
     return v;
 }
 
-/// Reads the partition table of `dev`. A protective MBR leads to GPT.
+/// Reads the partition table of `dev`. A protective MBR leads to GPT. The
+/// entries are reported as written: they may reach past the end of `dev`,
+/// which may be only the start of a disk.
 pub fn read(dev: blockdev.BlockDev) Error!Table {
     var sector: [blockdev.max_sector_size]u8 = undefined;
     const ss = dev.sector_size;
+    // Also what keeps the offsets used below inside a sector.
+    if (ss < 512 or ss > blockdev.max_sector_size or !std.math.isPowerOfTwo(ss)) return error.NoPartitionTable;
     try dev.readSectors(0, sector[0..ss]);
     if (sector[510] != 0x55 or sector[511] != 0xAA) return error.NoPartitionTable;
 
@@ -123,7 +127,35 @@ pub fn read(dev: blockdev.BlockDev) Error!Table {
     for (entries) |e| {
         if (e.type == 0xEE) return readGpt(dev);
     }
+    // A filesystem boot sector ends in 0x55AA too. Real partition entries win:
+    // a disk may keep an old filesystem's first bytes after repartitioning.
+    if (isFilesystemBootSector(sector[0..ss]) and !plausibleEntries(entries))
+        return error.NoPartitionTable;
     return readMbr(dev, sector[0..ss], entries);
+}
+
+/// Whether sector 0 starts like a FAT, NTFS or exFAT filesystem.
+fn isFilesystemBootSector(s: []const u8) bool {
+    if (std.mem.eql(u8, s[3..11], "NTFS    ") or std.mem.eql(u8, s[3..11], "EXFAT   ")) return true;
+    // A jump over a BIOS parameter block with possible values.
+    if (s[0] != 0xEB and s[0] != 0xE9) return false;
+    const bytes_per_sector = std.mem.readInt(u16, s[11..13], .little);
+    if (bytes_per_sector < 512 or bytes_per_sector > 4096 or !std.math.isPowerOfTwo(bytes_per_sector)) return false;
+    const reserved = std.mem.readInt(u16, s[14..16], .little);
+    return std.math.isPowerOfTwo(s[13]) and reserved != 0 and (s[16] == 1 or s[16] == 2) and
+        (s[21] == 0xF0 or s[21] >= 0xF8); // the media descriptor
+}
+
+/// Whether the four entries can be a partition table: legal status bytes and
+/// at least one partition. (`dev` may be only the start of a disk, so where a
+/// partition lies says nothing.)
+fn plausibleEntries(entries: [4]MbrEntry) bool {
+    var used = false;
+    for (entries) |e| {
+        if (e.status != 0 and e.status != 0x80) return false;
+        if (e.type != 0 and e.sectors != 0 and e.lba != 0) used = true;
+    }
+    return used;
 }
 
 fn isExtended(t: u8) bool {
@@ -203,13 +235,16 @@ fn readGptAt(dev: blockdev.BlockDev, lba: u64) Error!Table {
     if (h.entry_size < @sizeOf(GptEntry) or h.entry_size > 4096 or h.num_entries == 0 or h.num_entries > 4096)
         return error.NoPartitionTable;
 
+    // A header says which sector it is meant to be in.
+    if (h.my_lba != lba) return error.NoPartitionTable;
+
     var t = Table{ .kind = .gpt, .disk_guid = h.disk_guid };
     // Entries are checksummed as one array; stream them while accumulating
     // the CRC so no allocation is needed.
     var running: u32 = 0xFFFFFFFF;
     var i: u32 = 0;
     var buf: [4096]u8 = undefined;
-    const table_off = h.entries_lba * dev.sector_size;
+    const table_off = std.math.mul(u64, h.entries_lba, dev.sector_size) catch return error.NoPartitionTable;
     while (i < h.num_entries) : (i += 1) {
         const e_buf = buf[0..h.entry_size];
         try dev.readBytes(table_off + @as(u64, i) * h.entry_size, e_buf);
@@ -221,7 +256,7 @@ fn readGptAt(dev: blockdev.BlockDev, lba: u64) Error!Table {
         t.add(.{
             .number = @intCast(i + 1),
             .start_lba = e.first_lba,
-            .sector_count = e.last_lba - e.first_lba + 1,
+            .sector_count = (e.last_lba - e.first_lba) +| 1,
             .type_guid = e.type_guid,
             .part_guid = e.part_guid,
         });

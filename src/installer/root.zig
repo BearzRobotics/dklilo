@@ -5,6 +5,8 @@ pub const genconfig = @import("genconfig.zig");
 pub const arch = @import("arch.zig");
 pub const bootvars = @import("bootvars.zig");
 pub const blockinfo = @import("blockinfo.zig");
+pub const mounts = @import("mounts.zig");
+pub const safefile = @import("safefile.zig");
 test {
     _ = plan;
     _ = fat12;
@@ -12,4 +14,6 @@ test {
     _ = arch;
     _ = bootvars;
     _ = blockinfo;
+    _ = mounts;
+    _ = safefile;
 }

@@ -10,6 +10,10 @@ dklilo.conf - configuration file of the dklilo boot loader
 changing it takes effect at the next boot with nothing to reinstall. Its
 syntax follows LILO's.
 
+A flag such as `prompt` or `restricted` may be written alone; giving it the
+value `no`, `false`, `off` or `0` turns it off. If a key is repeated, the last
+one counts, and `dklilo check` warns.
+
 Each line is `key = value`. Text after `#` is a comment (a `#` inside double
 quotes is text). Values may be put in double quotes, which is needed for
 values with spaces. Blank lines are ignored.
@@ -46,12 +50,19 @@ an ISO written to a stick).
     and a `timeout` boots that entry without showing the menu.
 
 `serial = PORT,BAUD`
-:   Parsed; the BIOS loader uses COM1 at 115200 8N1 whatever is given.
+:   Parsed, but not used: the BIOS loader always uses COM1 at 115200 8N1, and
+    the UEFI loader the firmware's console.
 
 `password = HASH`
-:   The lowercase hexadecimal SHA-256 of the password needed to edit the
-    command line of `restricted` entries. Never store the password itself;
-    produce the hash with `printf %s 'secret' | sha256sum`.
+:   The hexadecimal SHA-256 of the password needed to edit the command line
+    of `restricted` entries, and to boot by hand from the menu. Never store
+    the password itself; produce the hash with
+    `printf %s 'secret' | sha256sum`. A password may be up to 256 characters.
+
+    Unlike LILO's, it does not guard booting an entry as written. With no
+    `restricted` entry, anyone can edit command lines; `dklilo check` warns.
+    It also does not protect the prompt shown when there is no usable
+    configuration.
 
 ## ENTRY KEYS
 
@@ -61,7 +72,9 @@ an ISO written to a stick).
 
 `other = TARGET`
 :   Starts an entry that chainloads another system. `windows` finds Windows
-    Boot Manager (UEFI: `\EFI\Microsoft\Boot\bootmgfw.efi` on the ESP; BIOS:
+    Boot Manager (UEFI: `\EFI\Microsoft\Boot\bootmgfw.efi`, taken from the
+    volume dklilo was loaded from, else from another volume of that disk, else
+    from another disk, among those the firmware has made readable; BIOS:
     the NTFS partition with a Windows-style boot sector, preferring the active
     one). On BIOS, a partition number (`2`, `/dev/sda2`) selects the partition
     to chainload. On UEFI, any other value is the path of an EFI application
@@ -96,7 +109,8 @@ an ISO written to a stick).
     under the top-level subvolume. Default: the filesystem's default subvolume.
 
 `restricted`
-:   Editing this entry's command line needs `password`.
+:   Editing this entry's command line needs `password`. Without a `password`
+    it does nothing.
 
 ## PATHS
 
@@ -108,17 +122,28 @@ configuration was read from. A prefix selects another one:
     PARTUUID=4a6f8c21-02:/vmlinuz   (GPT GUID, or MBR signature-NN)
 
 A configuration stored on the ESP therefore normally names its kernel with a
-prefix. `UUID=` does not match FAT or ISO 9660 volumes.
+prefix. `UUID=` does not match FAT or ISO 9660 volumes. When more than one volume
+matches a prefix, one on the same disk as the configuration is preferred, so
+that a cloned disk or a USB stick does not take over.
+
+A command line (`root=`, `append` and what dklilo adds) may be up to 1024
+bytes. A path must name a regular file, or a symlink to one.
 
 Supported filesystems: ext2, ext3, ext4, btrfs (single, DUP and RAID1 profiles;
 zlib, LZO and zstd compression), FAT12/16/32 and ISO 9660 with Rock Ridge.
 
 ## THE MENU
 
-Up/Down choose an entry and Enter boots it. `e` edits the kernel command line
+Up/Down choose an entry and Enter boots it; a list too long for the screen
+scrolls. `e` edits the kernel command line
 (Enter boots, Esc goes back); for a `restricted` entry it asks for the
-password first. Any key stops the countdown. The menu appears on the screen and
-on the serial port at the same time.
+password first. `m` boots a kernel by hand: it asks for the kernel's path and a
+command line, after the password if one is configured. Any key stops the
+countdown. The menu appears on the screen and on the serial port at the same
+time.
+
+After a boot fails, or returns to the loader, the menu is shown and waits for a
+key, even if the configuration would boot without it.
 
 ## EXAMPLE
 

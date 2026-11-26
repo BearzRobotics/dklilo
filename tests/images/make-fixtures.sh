@@ -90,7 +90,7 @@ mkfs.ext4 -F -q -b 1024 -d "$w/holes" "$out/ext4-holes.img" >/dev/null 2>&1
 mk ext4-desc128 mkfs.ext4 -F -q -b 4096 -g 1024 -O 64bit,metadata_csum -E desc_size=128
 
 # No checksums, so a test can change one on-disk value and have it believed.
-mkdir "$w/plain"; head -c 20000 /dev/urandom > "$w/plain/f"
+mkdir "$w/plain"; head -c 20000 /dev/urandom > "$w/plain/f"; mkfifo "$w/plain/fifo"
 truncate -s 16M "$out/ext4-nocsum.img"
 mkfs.ext4 -F -q -b 4096 -O '64bit,^metadata_csum' -d "$w/plain" "$out/ext4-nocsum.img" >/dev/null 2>&1
 

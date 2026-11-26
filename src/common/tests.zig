@@ -624,7 +624,7 @@ test "fat: random damage to the boot sector and directories never crashes" {
 fn loadFixture(name: []const u8) ![]u8 {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ test_options.fixtures_dir, name });
-    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(200 << 20)) catch |e| switch (e) {
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(512 << 20)) catch |e| switch (e) {
         error.FileNotFound => error.SkipZigTest, // the optional btrfs images
         else => e,
     };
@@ -1017,6 +1017,206 @@ test "fat32: an out-of-range root cluster is corrupt" {
     var fs = try fat.Fs.open(gpa, devio.fromRegion(&bd, bd.whole()));
     defer fs.deinit();
     try std.testing.expectError(error.Corrupt, fs.lookup("/boot"));
+}
+
+// ---- finding volumes (docs/bugs CMN-02 to CMN-07, CMN-12) --------------------
+
+const volumes = @import("volumes.zig");
+
+/// How many volumes `image`, taken as a disk, is seen to hold.
+fn volumeCount(image: []const u8) !usize {
+    var d = disk(image);
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(d.blockDev());
+    return set.vols.items.len;
+}
+
+test "a FAT filesystem on a whole disk is one volume" {
+    for ([_][]const u8{ "fat12.img", "fat16.img", "fat32.img" }) |name| {
+        const img = try loadFixture(name);
+        defer gpa.free(img);
+        var d = disk(img);
+        var set = volumes.Set.init(gpa);
+        defer set.deinit();
+        _ = try set.addDisk(d.blockDev());
+        try std.testing.expectEqual(@as(usize, 1), set.vols.items.len);
+        try std.testing.expectEqual(@as(u8, 0), set.vols.items[0].number);
+        try std.testing.expect(set.vols.items[0].filesystem(gpa) != null);
+    }
+}
+
+test "partitions win over a boot sector left from an old FAT filesystem" {
+    const img = try gpa.dupe(u8, @embedFile("mbr.img"));
+    defer gpa.free(img);
+    const fat_img = try loadFixture("fat16.img");
+    defer gpa.free(fat_img);
+    @memcpy(img[0..62], fat_img[0..62]); // jump, BPB and "FAT16" type string
+    try std.testing.expectEqual(@as(usize, 5), try volumeCount(img));
+}
+
+test "a disk with an empty partition table can still hold a filesystem" {
+    const img = try gpa.dupe(u8, @embedFile("ext4.img"));
+    defer gpa.free(img);
+    img[510] = 0x55; // the first 1024 bytes of ext4 are free for boot code
+    img[511] = 0xAA;
+    try std.testing.expectEqual(@as(usize, 1), try volumeCount(img));
+}
+
+test "LABEL= and UUID= prefer the configuration's own disk" {
+    // Two disks with identical filesystems, as after cloning.
+    var a = disk(@embedFile("ext4.img"));
+    var b = disk(@embedFile("ext4.img"));
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(a.blockDev());
+    _ = try set.addDisk(b.blockDev());
+    const second = &set.vols.items[1];
+    try std.testing.expect((try set.resolve("LABEL=dkltest:/x", second)).vol == second);
+    var u: [36]u8 = undefined;
+    volumes.formatUuid(second.filesystem(gpa).?.uuid(), &u);
+    var spec: [64]u8 = undefined;
+    try std.testing.expect((try set.resolve(try std.fmt.bufPrint(&spec, "UUID={s}:/x", .{u}), second)).vol == second);
+    // A volume only another disk has is still found.
+    try std.testing.expect((try set.resolve("LABEL=dkltest:/x", &set.vols.items[0])).vol == &set.vols.items[0]);
+}
+
+test "UUID= does not match FAT" {
+    const img = try loadFixture("fat16.img");
+    defer gpa.free(img);
+    var a = disk(@embedFile("ext4.img"));
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(a.blockDev());
+    var f = disk(img);
+    var bd = f.blockDev();
+    try set.vols.append(gpa, .{ .region = bd.whole(), .dev = &bd, .disk = 1, .number = 0 });
+    var u: [36]u8 = undefined;
+    volumes.formatUuid(set.vols.items[1].filesystem(gpa).?.uuid(), &u);
+    var spec: [64]u8 = undefined;
+    try std.testing.expectError(error.NoSuchVolume, set.resolve(try std.fmt.bufPrint(&spec, "UUID={s}:/x", .{u}), &set.vols.items[0]));
+}
+
+/// A disk whose reads can be made to fail.
+const FlakyDisk = struct {
+    data: []const u8,
+    failing: bool = false,
+
+    fn blockDev(self: *FlakyDisk) blockdev.BlockDev {
+        return .{ .ctx = self, .readSectorsFn = read, .sector_size = 512, .sector_count = self.data.len / 512 };
+    }
+    fn read(ctx: *anyopaque, lba: u64, buf: []u8) blockdev.Error!void {
+        const self: *FlakyDisk = @ptrCast(@alignCast(ctx));
+        if (self.failing) return error.IoError;
+        @memcpy(buf, self.data[@intCast(lba * 512)..][0..buf.len]);
+    }
+};
+
+test "a read error while looking for a filesystem isn't remembered" {
+    var d = FlakyDisk{ .data = @embedFile("ext4.img") };
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(d.blockDev());
+    d.failing = true;
+    try std.testing.expect(set.vols.items[0].filesystem(gpa) == null);
+    d.failing = false;
+    try std.testing.expect(set.vols.items[0].filesystem(gpa) != null);
+}
+
+/// A GPT disk of 64 sectors with one partition, `first..=last`.
+fn gptDisk(img: *[64 * 512]u8, first: u64, last: u64, my_lba: u64) void {
+    img.* = @splat(0);
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    img[446 + 4] = 0xEE;
+    const h = img[512..1024];
+    @memcpy(h[0..8], "EFI PART");
+    put(u32, h, 12, 92); // header size
+    put(u64, h, 24, my_lba);
+    put(u64, h, 72, 2); // entries
+    put(u32, h, 80, 1);
+    put(u32, h, 84, 128);
+    const e = img[1024..][0..128];
+    e[0] = 1; // any type
+    put(u64, e, 32, first);
+    put(u64, e, 40, last);
+    put(u32, h, 88, fsread.crc.crc32(e));
+    put(u32, h, 16, fsread.crc.crc32(h[0..92]));
+}
+
+test "gpt: impossible partitions are dropped or cut to the disk" {
+    var img: [64 * 512]u8 = undefined;
+    var d = disk(&img);
+    for ([_]struct { first: u64, last: u64, sectors: ?u64 }{
+        .{ .first = 0, .last = std.math.maxInt(u64), .sectors = 64 }, // `last - first + 1` overflows
+        .{ .first = 1 << 62, .last = (1 << 62) + 10, .sectors = null }, // starts past the end
+        .{ .first = 10, .last = 1000, .sectors = 54 }, // runs past the end
+        .{ .first = 10, .last = 20, .sectors = 11 },
+    }) |case| {
+        gptDisk(&img, case.first, case.last, 1);
+        var set = volumes.Set.init(gpa);
+        defer set.deinit();
+        _ = try set.addDisk(d.blockDev());
+        // A disk left with no partition counts as one whole volume (number 0).
+        const v = set.vols.items[0];
+        try std.testing.expectEqual(@as(u8, if (case.sectors == null) 0 else 1), v.number);
+        if (case.sectors) |n| try std.testing.expectEqual(n * 512, v.region.len);
+    }
+    // A header that says it belongs somewhere else.
+    gptDisk(&img, 10, 20, 7);
+    try std.testing.expectError(error.NoPartitionTable, part.read(d.blockDev()));
+}
+
+test "a partition table read from the start of a disk keeps what lies beyond" {
+    // `install-bios` parses only the first few MiB.
+    const whole = @embedFile("mbr.img");
+    var d = disk(whole[0 .. 64 * 512]);
+    const t = try part.read(d.blockDev());
+    var full = disk(whole);
+    try std.testing.expectEqual((try part.read(full.blockDev())).slice()[0].start_lba, t.slice()[0].start_lba);
+    try std.testing.expect(t.count >= 4); // three primaries and the extended one
+}
+
+test "only regular files can be opened" {
+    const img = try loadFixture("ext4-nocsum.img");
+    defer gpa.free(img);
+    var d = disk(img);
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(d.blockDev());
+    try std.testing.expectError(error.NotRegularFile, set.openFile(&set.vols.items[0], "/fifo", null));
+}
+
+test "the same ISO path on two volumes is two mounts" {
+    var a = disk(@embedFile("ext4.img"));
+    var b = disk(@embedFile("ext4.img"));
+    var set = volumes.Set.init(gpa);
+    defer set.deinit();
+    _ = try set.addDisk(a.blockDev());
+    _ = try set.addDisk(b.blockDev());
+    const first = try set.isoVolume(&set.vols.items[0], "/isos/nested.iso", null);
+    const second = try set.isoVolume(&set.vols.items[1], "/isos/nested.iso", null);
+    try std.testing.expect(first != second);
+}
+
+fn addAndMount(allocator: std.mem.Allocator) !void {
+    var a = disk(@embedFile("ext4.img"));
+    var set = volumes.Set.init(allocator);
+    defer set.deinit();
+    _ = try set.addDisk(a.blockDev());
+    if (set.vols.items[0].filesystem(allocator) == null) return error.OutOfMemory;
+    _ = try set.isoVolume(&set.vols.items[0], "/isos/nested.iso", "sv");
+}
+
+test "running out of memory while adding disks neither leaks nor frees twice" {
+    var a = disk(@embedFile("mbr.img"));
+    var fail_at: usize = 0;
+    while (fail_at < 32) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        var set = volumes.Set.init(failing.allocator());
+        defer set.deinit();
+        _ = set.addDisk(a.blockDev()) catch continue;
+    }
 }
 
 // ---- fuzzing -----------------------------------------------------------------

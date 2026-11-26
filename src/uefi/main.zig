@@ -58,9 +58,13 @@ const UefiConsole = struct {
         var buf: [129]u16 = undefined;
         var i: usize = 0;
         while (i < s.len) {
-            const n = @min(s.len - i, 128);
-            for (s[i..][0..n], 0..) |c, j| buf[j] = c;
-            buf[n] = 0;
+            var n = @min(s.len - i, 128);
+            // Don't cut a UTF-8 character in two.
+            if (i + n < s.len) {
+                while (n > 125 and s[i + n] & 0xC0 == 0x80) n -= 1;
+            }
+            const units = common.console.utf16FromUtf8(&buf, s[i..][0..n]);
+            buf[units] = 0;
             _ = out().outputString(@ptrCast(&buf)) catch {};
             i += n;
         }
@@ -90,7 +94,7 @@ const UefiConsole = struct {
                         0x08 => return .backspace,
                         0x09 => return .tab,
                         0x20...0x7E => return .{ .char = @intCast(k.unicode_char) },
-                        else => {},
+                        else => return .other,
                     },
                 }
             } else |_| {}
@@ -102,9 +106,10 @@ const UefiConsole = struct {
 };
 
 fn say(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    UefiConsole.puts(&UefiConsole.dummy, s);
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print(fmt, args) catch {}; // a long message is cut short, not dropped
+    UefiConsole.puts(&UefiConsole.dummy, w.buffered());
 }
 
 // ---- block devices ---------------------------------------------------------
@@ -152,6 +157,16 @@ fn pathPrefix(p: *const DevicePath) []const u8 {
     return bytes[0..total -| 4];
 }
 
+/// A bounce buffer aligned for the device. Pages are aligned to 4 KiB, so a
+/// stricter device gets extra room to move the start into.
+fn alignedBounce(bs: *uefi.tables.BootServices, io_align: usize) ?[]align(4096) u8 {
+    const extra = if (io_align > 4096) io_align else 0;
+    const pages = bs.allocatePages(.any, .boot_services_data, (UefiDisk.bounce_size + extra) / 4096) catch return null;
+    const start: [*]u8 = @ptrCast(pages.ptr);
+    const skip = std.mem.alignForward(usize, @intFromPtr(start), @max(io_align, 4096)) - @intFromPtr(start);
+    return @alignCast(start[skip..][0..UefiDisk.bounce_size]);
+}
+
 // ---- device tree ------------------------------------------------------------
 
 const device_tree_guid align(8) = Guid{
@@ -182,7 +197,9 @@ fn protectDeviceTree(bs: *uefi.tables.BootServices) void {
         if (std.mem.readInt(u32, src[0..4], .big) != 0xd00dfeed) return;
         const size = std.mem.readInt(u32, src[4..8], .big);
         if (size < 40 or size > 4 << 20) return;
-        const pages = bs.allocatePages(.any, .boot_services_data, (size + 4095) / 4096) catch return;
+        // The operating system may reclaim boot services memory; the table
+        // has to stay (the type for tables it frees once it has read them).
+        const pages = bs.allocatePages(.any, .acpi_reclaim_memory, (size + 4095) / 4096) catch return;
         const dst: [*]u8 = @ptrCast(pages.ptr);
         @memcpy(dst[0..size], src[0..size]);
         bs.installConfigurationTable(&device_tree_guid, @ptrCast(dst)) catch {};
@@ -286,8 +303,15 @@ fn bootLinux(
         try parts.append(allocator, data);
         total += std.mem.alignForward(usize, data.len, 4);
     }
+    // The initramfs is offered only while this attempt lasts: a kernel that
+    // returns must not leave it for the next one.
+    var joined: []u8 = &.{};
+    defer {
+        initrd_data = &.{};
+        allocator.free(joined);
+    }
     if (total > 0) {
-        const joined = try allocator.alloc(u8, total);
+        joined = try allocator.alloc(u8, total);
         var off: usize = 0;
         for (parts.items) |p| {
             @memcpy(joined[off..][0..p.len], p);
@@ -300,25 +324,37 @@ fn bootLinux(
 
     // UTF-16 command line for LoadedImage.load_options.
     const opts = try allocator.alloc(u16, cmdline.len + 1);
-    for (cmdline, 0..) |c, i| opts[i] = c;
-    opts[cmdline.len] = 0;
+    defer allocator.free(opts);
+    const units = common.console.utf16FromUtf8(opts, cmdline);
+    opts[units] = 0;
 
     const handle = bs.loadImage(false, uefi.handle, .{ .buffer = kernel }) catch |e| {
         say("\r\nLoadImage failed: {s}", .{@errorName(e)});
         return error.LoadFailed;
     };
+    // The firmware unloads an application that has run and returned; one that
+    // was never started is ours to unload.
+    var started = false;
+    defer if (!started) {
+        _ = bs.unloadImage(handle) catch {};
+    };
     const li = (bs.handleProtocol(LoadedImage, handle) catch null) orelse return error.LoadFailed;
     li.load_options = opts.ptr;
-    li.load_options_size = @intCast(opts.len * 2);
+    li.load_options_size = @intCast((units + 1) * 2);
 
+    var initrd_handle: ?uefi.Handle = null;
     if (total > 0) {
-        _ = bs.installProtocolInterfaces(null, .{ &initrd_path, &lf2 }) catch |e| {
+        initrd_handle = bs.installProtocolInterfaces(null, .{ &initrd_path, &lf2 }) catch |e| {
             say("\r\ninitrd protocol install failed: {s}", .{@errorName(e)});
             return error.LoadFailed;
         };
     }
+    defer if (initrd_handle) |h| {
+        bs.uninstallProtocolInterfaces(h, .{ &initrd_path, &lf2 }) catch {};
+    };
 
     say("\r\nStarting kernel...\r\n", .{});
+    started = true;
     _ = bs.startImage(handle) catch |e| {
         say("\r\nStartImage failed: {s}", .{@errorName(e)});
         return error.StartFailed;
@@ -353,7 +389,13 @@ fn chainEfi(target: []const u8) void {
         say("\r\nNo FAT volumes found.", .{});
         return;
     };
-    for (handles) |h| {
+    defer bs.freePool(@ptrCast(@alignCast(handles.ptr))) catch {};
+    // The volume dklilo was loaded from first (normally the ESP), then the
+    // rest of its disk, then other disks: a stick left plugged in must not
+    // replace the installed system.
+    var found_any = false;
+    for ([_]Nearness{ .own_volume, .own_disk, .elsewhere }) |pass| for (handles) |h| {
+        if (nearness(bs, h) != pass) continue;
         const sfs = (bs.handleProtocol(SimpleFileSystem, h) catch null) orelse continue;
         const root = sfs.openVolume() catch continue;
         const f = root.open(&path16, .read, .{}) catch {
@@ -365,17 +407,36 @@ fn chainEfi(target: []const u8) void {
 
         const dp = (bs.handleProtocol(DevicePath, h) catch null) orelse continue;
         const full = dp.createFileDevicePath(allocator, path16[0..n]) catch continue;
+        // As long as `createFileDevicePath` allocated it.
+        const full_len = dp.size() + 2 * (n + 1) + @sizeOf(DevicePath);
+        defer allocator.free(@as([*]const u8, @ptrCast(full))[0..full_len]);
         say("\r\nStarting {s}...\r\n", .{path8});
+        found_any = true;
         const img = bs.loadImage(false, uefi.handle, .{ .device_path = full }) catch |e| {
             say("\r\nLoadImage failed: {s}", .{@errorName(e)});
-            return;
+            continue; // another volume may have one that works
         };
         _ = bs.startImage(img) catch |e| {
             say("\r\nStartImage failed: {s}", .{@errorName(e)});
         };
         return;
-    }
-    say("\r\n{s} not found on any FAT volume.", .{path8});
+    };
+    if (!found_any) say("\r\n{s} not found on any FAT volume.", .{path8});
+}
+
+/// Device paths (without their end nodes) of the volume dklilo was loaded
+/// from and of the disk it is on, where the firmware says.
+var own_volume_path: ?[]const u8 = null;
+var own_disk_path: ?[]const u8 = null;
+
+const Nearness = enum { own_volume, own_disk, elsewhere };
+
+fn nearness(bs: *uefi.tables.BootServices, h: uefi.Handle) Nearness {
+    const dp = (bs.handleProtocol(DevicePath, h) catch null) orelse return .elsewhere;
+    const path = pathPrefix(dp);
+    if (own_volume_path) |own| if (std.mem.eql(u8, own, path)) return .own_volume;
+    if (own_disk_path) |disk| if (std.mem.startsWith(u8, path, disk)) return .own_disk;
+    return .elsewhere;
 }
 
 pub fn main() void {
@@ -393,6 +454,7 @@ pub fn main() void {
     if (bs.handleProtocol(LoadedImage, uefi.handle) catch null) |me| {
         if (me.device_handle) |dh| {
             if (bs.handleProtocol(DevicePath, dh) catch null) |p| self_path = pathPrefix(p);
+            own_volume_path = self_path;
         }
     }
 
@@ -400,12 +462,19 @@ pub fn main() void {
     for (handles) |h| {
         const bio = (bs.handleProtocol(BlockIo, h) catch null) orelse continue;
         if (!bio.media.media_present or bio.media.logical_partition) continue;
-        const bounce = bs.allocatePages(.any, .boot_services_data, UefiDisk.bounce_size / 4096) catch continue;
+        const ss = bio.media.block_size;
+        if (ss < 512 or ss > common.blockdev.max_sector_size or !std.math.isPowerOfTwo(ss)) continue;
+        const io_align: usize = @max(bio.media.io_align, 1);
+        if (!std.math.isPowerOfTwo(io_align) or io_align > 1 << 16) continue;
+        const bounce = alignedBounce(bs, io_align) orelse continue;
         const disk = allocator.create(UefiDisk) catch continue;
-        disk.* = .{ .bio = bio, .bounce = @ptrCast(bounce) };
+        disk.* = .{ .bio = bio, .bounce = bounce };
         const idx = set.addDisk(disk.blockDev()) catch continue;
         if (self_path) |sp| if (bs.handleProtocol(DevicePath, h) catch null) |dp| {
-            if (std.mem.startsWith(u8, sp, pathPrefix(dp))) boot_disk = idx;
+            if (std.mem.startsWith(u8, sp, pathPrefix(dp))) {
+                boot_disk = idx;
+                own_disk_path = pathPrefix(dp);
+            }
         };
     }
 
@@ -414,7 +483,9 @@ pub fn main() void {
     if (found == null and boot_disk != null) found = set.findConfig(null);
 
     if (found) |f| {
-        const text = set.readFile(f.vol, f.path) catch {
+        const text = set.readFile(f.vol, f.path) catch |e| {
+            say("cannot read {s}: {s}\r\n", .{ f.path, @errorName(e) });
+            _ = con.getKey(3000);
             return manual(&set, con);
         };
         var diag = common.config.Diagnostic{};
@@ -423,9 +494,23 @@ pub fn main() void {
             _ = con.getKey(3000);
             return manual(&set, con);
         };
+        var failed = false; // from then on, only a key starts anything
         while (true) {
-            var cmd: [1024]u8 = undefined;
-            const choice = common.menu.run(con, &cfg, &cmd) orelse return manual(&set, con);
+            var cmd: [common.menu.max_cmdline]u8 = undefined;
+            const result = common.menu.run(con, &cfg, &cmd, failed) orelse return manual(&set, con);
+            failed = true;
+            const choice = switch (result) {
+                .boot => |choice| choice,
+                .manual => {
+                    var pbuf: [256]u8 = undefined;
+                    if (common.menu.manualPrompt(con, .chosen, &pbuf, &cmd)) |r| {
+                        bootLinux(&set, f.vol, r.path, &.{}, null, null, r.cmdline) catch {};
+                        say("\r\nBoot failed. Press a key.", .{});
+                        _ = con.getKey(null);
+                    }
+                    continue;
+                },
+            };
             const entry = cfg.entries[choice.index];
             switch (entry.kind) {
                 .linux => {
@@ -441,7 +526,18 @@ pub fn main() void {
             }
         }
     }
+    if (found == null) reportProbeErrors(&set, con);
     manual(&set, con);
+}
+
+/// With no configuration found, says which volumes couldn't be looked into.
+fn reportProbeErrors(set: *common.volumes.Set, con: Console) void {
+    var any = false;
+    for (set.vols.items) |v| if (v.probe_error) |e| {
+        say("disk {d} partition {d}: {s}\r\n", .{ v.disk, v.number, @errorName(e) });
+        any = true;
+    };
+    if (any) _ = con.getKey(5000);
 }
 
 /// No usable configuration: let the user type a kernel path and command line.
@@ -458,8 +554,8 @@ fn manual(set: *common.volumes.Set, con: Console) void {
     };
     while (true) {
         var pbuf: [256]u8 = undefined;
-        var cbuf: [1024]u8 = undefined;
-        const r = common.menu.manualPrompt(con, &pbuf, &cbuf) orelse return;
+        var cbuf: [common.menu.max_cmdline]u8 = undefined;
+        const r = common.menu.manualPrompt(con, .no_config, &pbuf, &cbuf) orelse return;
         bootLinux(set, vol, r.path, &.{}, null, null, r.cmdline) catch {};
         say("\r\nBoot failed. Press a key.", .{});
         _ = con.getKey(null);

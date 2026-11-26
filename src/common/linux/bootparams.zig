@@ -104,8 +104,13 @@ pub const Kernel = struct {
 /// Parses and validates the start of a bzImage (at least 0x270 bytes).
 pub fn parseKernel(image_start: []const u8, file_size: u64) Error!Kernel {
     if (image_start.len < 0x270) return error.NotLinux;
-    var hdr: SetupHeader = undefined;
-    @memcpy(std.mem.asBytes(&hdr), image_start[header_offset..][0..@sizeOf(SetupHeader)]);
+    // The header says where it ends (byte 0x201, counted from 0x202). What
+    // follows is not part of it. A 2.10 header has at least `init_size`.
+    const declared = 0x202 + @as(usize, image_start[0x201]);
+    const min_end = header_offset + @offsetOf(SetupHeader, "handover_offset");
+    const end = std.math.clamp(declared, min_end, header_offset + @sizeOf(SetupHeader));
+    var hdr = std.mem.zeroes(SetupHeader);
+    @memcpy(std.mem.asBytes(&hdr)[0 .. end - header_offset], image_start[header_offset..end]);
     if (hdr.header != 0x53726448 or hdr.boot_flag != 0xAA55) return error.NotLinux; // "HdrS"
     if (hdr.version < 0x020A or hdr.loadflags & loaded_high == 0) return error.TooOld;
     const sects: u32 = if (hdr.setup_sects == 0) 4 else hdr.setup_sects;
@@ -153,6 +158,24 @@ pub fn setVgaText(page: *[boot_params_size]u8, cursor_row: u8, cursor_col: u8) v
     page[0x10] = 16; // orig_video_points
 }
 
+/// The lowest address a relocatable kernel unpacks itself at.
+const min_run_address: u64 = 0x1000000;
+
+/// Where the kernel will run, and so unpack itself into `init_size` bytes
+/// (boot.rst, "init_size"). A relocatable one moves from where it was loaded
+/// up to its alignment, and no lower than `pref_address`; any other runs at
+/// `pref_address`.
+pub fn runAddress(header: SetupHeader, loaded_at: u64) u64 {
+    const preferred: u64 = header.pref_address;
+    if (header.relocatable_kernel == 0 and preferred != 0) return preferred;
+    var alignment: u64 = header.kernel_alignment;
+    if (alignment < 0x1000 or !std.math.isPowerOfTwo(alignment)) alignment = 0x1000;
+    const lowest = @max(loaded_at, min_run_address, preferred);
+    // `pref_address` is 64 bits of unchecked file contents.
+    if (lowest > std.math.maxInt(u64) - alignment) return lowest;
+    return std.mem.alignForward(u64, lowest, alignment);
+}
+
 /// Whether every byte of `start..end` is usable RAM according to the map:
 /// covered by usable entries (possibly several, side by side) and touched by
 /// no entry of any other kind.
@@ -180,7 +203,7 @@ pub fn placeInitrd(e820: []const E820Entry, addr_max: u32, size: u64, floor: u64
     var best: ?u64 = null;
     for (e820) |e| {
         if (e.kind != E820Entry.usable) continue;
-        var end = e.addr + e.size;
+        var end = e.addr +| e.size;
         end = @min(end, @as(u64, addr_max) + 1);
         if (end <= e.addr or end < size) continue;
         const start = (end - size) & ~@as(u64, 0xFFF);
@@ -268,4 +291,35 @@ test "boot_params gets the e820 map and loader id" {
     try std.testing.expectEqual(@as(u8, 1), page[0x1E8]);
     try std.testing.expectEqual(@as(u64, 0x100000), std.mem.readInt(u64, page[0x2D0..][0..8], .little));
     try std.testing.expectEqual(@as(u32, 0x53726448), std.mem.readInt(u32, page[0x202..][0..4], .little));
+}
+
+test "header bytes past the length the kernel declares are not copied" {
+    var buf = std.mem.zeroes([0x300]u8);
+    std.mem.writeInt(u32, buf[0x202..][0..4], 0x53726448, .little);
+    std.mem.writeInt(u16, buf[0x1FE..][0..2], 0xAA55, .little);
+    std.mem.writeInt(u16, buf[0x206..][0..2], 0x020A, .little);
+    buf[0x211] = 1;
+    buf[0x201] = 0x264 - 0x202; // a 2.10 header ends after init_size
+    std.mem.writeInt(u32, buf[0x260..][0..4], 0x1234, .little); // init_size
+    @memset(buf[0x264..0x26C], 0xEE); // not part of the header
+    const k = try parseKernel(&buf, 0x10000);
+    try std.testing.expectEqual(@as(u32, 0x1234), k.header.init_size);
+    try std.testing.expectEqual(@as(u32, 0), k.header.handover_offset);
+    try std.testing.expectEqual(@as(u32, 0), k.header.kernel_info_offset);
+}
+
+test "the run address honours pref_address" {
+    var h = std.mem.zeroes(SetupHeader);
+    h.kernel_alignment = 0x200000;
+    h.relocatable_kernel = 1;
+    try std.testing.expectEqual(@as(u64, 0x1000000), runAddress(h, 0x100000));
+    h.pref_address = 0x4100000;
+    try std.testing.expectEqual(@as(u64, 0x4200000), runAddress(h, 0x100000)); // aligned up
+    h.relocatable_kernel = 0;
+    try std.testing.expectEqual(@as(u64, 0x4100000), runAddress(h, 0x100000));
+    // Nonsense in the file must not trip the arithmetic.
+    h.relocatable_kernel = 1;
+    h.kernel_alignment = 0x3001;
+    h.pref_address = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), runAddress(h, 0x100000));
 }

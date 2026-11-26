@@ -3,6 +3,8 @@
 //! UEFI build with SimpleTextInput/Output and the serial port, and tests with
 //! a scripted fake. Serial and screen are mirrored by the implementation.
 
+const std = @import("std");
+
 pub const Key = union(enum) {
     /// A printable ASCII character.
     char: u8,
@@ -17,6 +19,8 @@ pub const Key = union(enum) {
     enter,
     esc,
     tab,
+    /// A key on the keyboard with no meaning here. It still stops a countdown.
+    other,
     /// `getKey` waited the full timeout without a key.
     timeout,
 };
@@ -58,3 +62,50 @@ pub const Console = struct {
         return self.vtable.size(self.ctx);
     }
 };
+
+/// Converts UTF-8 to UTF-16, as UEFI wants its text, and returns the number of
+/// code units. `out` needs room for `text.len`. A byte that is not part of
+/// valid UTF-8 becomes the code unit of the same value.
+pub fn utf16FromUtf8(out: []u16, text: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        // One byte on its own, unless a whole valid sequence starts here.
+        var point: u21 = text[i];
+        var len: usize = 1;
+        if (std.unicode.utf8ByteSequenceLength(text[i])) |expected| {
+            if (expected > 1 and expected <= text.len - i) {
+                if (std.unicode.utf8Decode(text[i..][0..expected])) |decoded| {
+                    point = decoded;
+                    len = expected;
+                } else |_| {}
+            }
+        } else |_| {}
+        i += len;
+        if (point < 0x10000) {
+            out[n] = @intCast(point);
+            n += 1;
+        } else {
+            const v = point - 0x10000;
+            out[n] = @intCast(0xD800 + (v >> 10));
+            out[n + 1] = @intCast(0xDC00 + (v & 0x3FF));
+            n += 2;
+        }
+    }
+    return n;
+}
+
+test "utf16FromUtf8" {
+    var out: [32]u16 = undefined;
+    const expect = struct {
+        fn f(want: []const u16, got: []const u16) !void {
+            try std.testing.expectEqualSlices(u16, want, got);
+        }
+    }.f;
+    try expect(&.{ 'a', 0xE9, 0x20AC, 0xD83D, 0xDE00 }, out[0..utf16FromUtf8(&out, "a\u{e9}\u{20ac}\u{1f600}")]);
+    // U+00C3 is the same number as the first byte that encodes it.
+    try expect(&.{ 0xC3, '!' }, out[0..utf16FromUtf8(&out, "\u{c3}!")]);
+    // Bytes that aren't valid UTF-8 are kept one by one.
+    try expect(&.{ 0xFF, 'x', 0xC3 }, out[0..utf16FromUtf8(&out, "\xFFx\xC3")]);
+    try expect(&.{ 0xC3, 'a' }, out[0..utf16FromUtf8(&out, "\xC3a")]);
+}

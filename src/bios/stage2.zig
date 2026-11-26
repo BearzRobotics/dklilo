@@ -24,6 +24,8 @@ comptime {
 // `stage2_early` checks that the stack and heap are RAM, and `bootLinux` that
 // the kernel stays below the stack and fits in RAM.
 const kernel_addr: u32 = 0x100000;
+/// The most of a command line handed to a kernel.
+const max_cmdline_area = 2048;
 const stack_floor: u32 = 0x1E00000;
 const stack_top: u32 = 0x1F00000;
 const heap_addr: usize = 0x2000000;
@@ -41,14 +43,17 @@ fn clearBss() void {
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [200]u8 = undefined;
-    con.puts(std.fmt.bufPrint(&buf, fmt, args) catch return);
+    var w = std.Io.Writer.fixed(&buf);
+    w.print(fmt, args) catch {}; // a long message is cut short, not dropped
+    con.puts(w.buffered());
 }
 
 // ---- memory map --------------------------------------------------------------
 
 var e820_buf: [bp.max_e820]bp.E820Entry = undefined;
 
-/// The firmware memory map from `int 15h, ax=E820h`.
+/// The firmware memory map: from `int 15h, ax=E820h`, or for a BIOS without
+/// it, one made up from the older memory size calls.
 fn readE820() []const bp.E820Entry {
     const buf: [*]u8 = @ptrFromInt(rm.scratch_addr + 0x40);
     var n: usize = 0;
@@ -73,6 +78,45 @@ fn readE820() []const bp.E820Entry {
         }
         cont = r.ebx;
         if (cont == 0) break;
+    }
+    if (n == 0) return oldMemoryMap();
+    return e820_buf[0..n];
+}
+
+/// Conventional memory in KiB, from `int 12h`.
+fn lowMemoryKib() u32 {
+    return rm.int(0x12, .{}).eax & 0xFFFF;
+}
+
+/// A map from `int 15h, ax=E801h` (or `ah=88h`) and `int 12h`, as the kernel's
+/// own setup code makes one. Empty if the BIOS answers neither.
+fn oldMemoryMap() []const bp.E820Entry {
+    var above_1m_kib: u32 = 0;
+    var above_16m_blocks: u32 = 0; // of 64 KiB
+    const r = rm.int(0x15, .{ .eax = 0xE801 });
+    if (!r.carry()) {
+        above_1m_kib = r.eax & 0xFFFF;
+        above_16m_blocks = r.ebx & 0xFFFF;
+        if (above_1m_kib == 0) { // some answer in cx and dx instead
+            above_1m_kib = r.ecx & 0xFFFF;
+            above_16m_blocks = r.edx & 0xFFFF;
+        }
+    }
+    if (above_1m_kib == 0) {
+        const old = rm.int(0x15, .{ .eax = 0x8800 });
+        if (!old.carry()) above_1m_kib = old.eax & 0xFFFF;
+    }
+    if (above_1m_kib == 0) return e820_buf[0..0];
+    var n: usize = 0;
+    const ranges = [_][2]u64{
+        .{ 0, @as(u64, lowMemoryKib()) * 1024 },
+        .{ 0x100000, @as(u64, above_1m_kib) * 1024 },
+        .{ 0x1000000, @as(u64, above_16m_blocks) * 65536 },
+    };
+    for (ranges) |range| {
+        if (range[1] == 0) continue;
+        e820_buf[n] = .{ .addr = range[0], .size = range[1], .kind = bp.E820Entry.usable };
+        n += 1;
     }
     return e820_buf[0..n];
 }
@@ -141,8 +185,11 @@ fn bootLinux(
 
     // Where the initramfs goes: size first, then as high as allowed.
     var total: u64 = 0;
-    var initrds: [8]@TypeOf(k) = undefined;
-    if (initrd_specs.len > initrds.len) return error.NotFound;
+    const initrds = set.allocator.alloc(@TypeOf(k), initrd_specs.len) catch {
+        say("\r\nnot enough memory for {d} initramfs files", .{initrd_specs.len});
+        return error.NoMemory;
+    };
+    defer set.allocator.free(initrds);
     for (initrd_specs, 0..) |spec, i| {
         initrds[i] = try open(set, default, spec, subvol);
         // Under 4 GiB each, so the sum of eight can't overflow.
@@ -152,15 +199,15 @@ fn bootLinux(
         }
         total += std.mem.alignForward(u64, initrds[i].file.size, 4);
     }
-    // A relocatable kernel moves itself to at least 16 MiB (aligned up) and
-    // needs init_size bytes there to decompress, so keep the initramfs above that.
-    const align_to: u64 = @max(kernel.header.kernel_alignment, 0x1000);
-    const run_at = std.mem.alignForward(u64, @max(@as(u64, kernel_addr), 0x1000000), align_to);
+    // The kernel moves itself to where it will run and needs init_size bytes
+    // there to decompress, so keep the initramfs above that.
+    const run_at = bp.runAddress(kernel.header, kernel_addr);
+    const run_end = run_at +| kernel.header.init_size;
     const load_end = kernel_addr + @as(u64, kernel.pm_size);
-    const kernel_end: u64 = @max(load_end, run_at + kernel.header.init_size);
+    const kernel_end: u64 = @max(load_end, run_end);
     // Without a memory map (a very old BIOS) there is nothing to check against.
     if (e820.len > 0 and !(bp.rangeUsable(e820, kernel_addr, load_end) and
-        bp.rangeUsable(e820, run_at, run_at + kernel.header.init_size)))
+        bp.rangeUsable(e820, run_at, run_end)))
     {
         say("\r\nnot enough memory for the kernel", .{});
         return error.NoMemory;
@@ -176,8 +223,9 @@ fn bootLinux(
     try readInto(k.fs, &k.file, kernel.setup_size, kernel_addr, kernel.pm_size);
     say("\r\nLoading initramfs...", .{});
     var off: u64 = 0;
-    for (initrd_specs, 0..) |_, i| {
-        var f = initrds[i];
+    // With nothing to load there is no address to load it to.
+    for (initrds[0..if (total > 0) initrds.len else 0]) |opened| {
+        var f = opened;
         try readInto(f.fs, &f.file, 0, initrd_at + off, f.file.size);
         const padded = std.mem.alignForward(u64, f.file.size, 4);
         const pad: [*]u8 = @ptrFromInt(@as(usize, @intCast(initrd_at + off + f.file.size)));
@@ -187,8 +235,9 @@ fn bootLinux(
 
     // Command line and the zero page.
     const cmd: [*]u8 = @ptrFromInt(rm.cmdline_addr);
-    const max_cmd = @min(@as(usize, if (kernel.header.cmdline_size == 0) 255 else kernel.header.cmdline_size), 2048) - 1;
+    const max_cmd = @min(@as(usize, if (kernel.header.cmdline_size == 0) 255 else kernel.header.cmdline_size), max_cmdline_area) - 1;
     const cn = @min(cmdline.len, max_cmd);
+    if (cn < cmdline.len) say("\r\nwarning: command line cut to {d} bytes, all this kernel takes", .{cn});
     @memcpy(cmd[0..cn], cmdline[0..cn]);
     cmd[cn] = 0;
 
@@ -207,16 +256,20 @@ fn bootLinux(
 // ---- chainloading ----------------------------------------------------------
 
 /// Loads another operating system's boot sector and jumps to it. `target` is
-/// `windows` (find the NTFS boot partition) or a partition number / device
-/// name ending in one (`2`, `/dev/sda2`) on the boot disk.
+/// `windows` (find the NTFS boot partition) or a partition of the boot disk: a
+/// number (`2`), or a device name ending in one (`/dev/sda2`).
 fn chainload(set: *common.volumes.Set, target: []const u8) void {
     const vol = if (std.mem.eql(u8, target, "windows"))
         set.findWindowsBoot(0)
     else blk: {
-        var end = target.len;
-        while (end > 0 and std.ascii.isDigit(target[end - 1])) end -= 1;
-        const n = std.fmt.parseInt(u8, target[end..], 10) catch break :blk null;
-        break :blk set.findPartition(0, n);
+        const wanted = common.config.chainPartition(target) orelse break :blk null;
+        const found = set.findPartition(0, wanted.number);
+        if (wanted.device_name and found != null) {
+            // The BIOS has no device names: say what is being started.
+            say("\r\n{s}: starting partition {d} of the boot disk\r\n", .{ target, wanted.number });
+            _ = con.getKey(2000);
+        }
+        break :blk found;
     };
     const v = vol orelse {
         say("\r\nNo boot partition found for '{s}'.", .{target});
@@ -225,6 +278,16 @@ fn chainload(set: *common.volumes.Set, target: []const u8) void {
     const sector: *[512]u8 = @ptrFromInt(rm.boot_sector_addr);
     v.region.readAt(0, sector) catch {
         say("\r\nCannot read the boot sector.", .{});
+        return;
+    };
+    if (sector[510] != 0x55 or sector[511] != 0xAA) {
+        say("\r\n'{s}' does not start with a boot sector (not a boot sector).", .{target});
+        return;
+    }
+    // The MBR entry a boot sector is handed holds 32-bit sector numbers.
+    const first_sector = v.region.start / v.region.dev.sector_size;
+    const lba = std.math.cast(u32, first_sector) orelse {
+        say("\r\n'{s}' starts too far into the disk to be chainloaded.", .{target});
         return;
     };
     // A copy of the MBR partition entry for ds:si, as the MBR would leave it.
@@ -238,9 +301,8 @@ fn chainload(set: *common.volumes.Set, target: []const u8) void {
     entry[5] = 0xFE;
     entry[6] = 0xFF;
     entry[7] = 0xFF;
-    const lba: u32 = @intCast(v.region.start / v.region.dev.sector_size);
     std.mem.writeInt(u32, entry[8..12], lba, .little);
-    std.mem.writeInt(u32, entry[12..16], @intCast(v.region.len / v.region.dev.sector_size), .little);
+    std.mem.writeInt(u32, entry[12..16], std.math.cast(u32, v.region.len / v.region.dev.sector_size) orelse std.math.maxInt(u32), .little);
     con.clear();
     rm.chainBootSector(rm.driveNumber());
 }
@@ -260,8 +322,8 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
     };
     while (true) {
         var pbuf: [256]u8 = undefined;
-        var cbuf: [1024]u8 = undefined;
-        const r = common.menu.manualPrompt(c, &pbuf, &cbuf) orelse return;
+        var cbuf: [common.menu.max_cmdline]u8 = undefined;
+        const r = common.menu.manualPrompt(c, .no_config, &pbuf, &cbuf) orelse return;
         bootLinux(set, vol, r.path, &.{}, null, null, r.cmdline) catch {};
         say("\r\nBoot failed. Press a key.", .{});
         _ = c.getKey(null);
@@ -273,6 +335,14 @@ fn manual(set: *common.volumes.Set, c: common.console.Console) void {
 export fn stage2_early() callconv(.c) void {
     clearBss();
     con.init();
+    // Conventional memory holds the loader, the disk buffer and what the
+    // kernel is handed; the BIOS may keep part of it for itself.
+    const low_needed = rm.cmdline_addr + max_cmdline_area;
+    const low = lowMemoryKib();
+    if (low * 1024 < low_needed) {
+        say("dklilo: not enough low memory ({d} KiB; {d} needed)\r\n", .{ low, (low_needed + 1023) / 1024 });
+        halt();
+    }
     const e820 = readE820();
     if (e820.len == 0) return;
     if (bp.rangeUsable(e820, stack_floor, stack_top) and
@@ -282,6 +352,16 @@ export fn stage2_early() callconv(.c) void {
         stack_floor >> 20, (heap_addr + heap_size) >> 20,
     });
     halt();
+}
+
+/// With no configuration found, says which volumes couldn't be looked into.
+fn reportProbeErrors(set: *common.volumes.Set, c: common.console.Console) void {
+    var any = false;
+    for (set.vols.items) |v| if (v.probe_error) |e| {
+        say("partition {d}: {s}\r\n", .{ v.number, @errorName(e) });
+        any = true;
+    };
+    if (any) _ = c.getKey(5000);
 }
 
 export fn stage2_main() callconv(.c) noreturn {
@@ -300,14 +380,30 @@ export fn stage2_main() callconv(.c) noreturn {
     };
     _ = set.addDisk(disk.blockDev()) catch halt();
 
-    if (set.findConfig(null)) |f| {
+    const found = set.findConfig(null);
+    if (found == null) reportProbeErrors(&set, c);
+    if (found) |f| {
         if (set.readFile(f.vol, f.path)) |text| {
             var diag = common.config.Diagnostic{};
             if (common.config.parse(allocator, text, &diag)) |parsed| {
                 var cfg = parsed;
+                var failed = false; // from then on, only a key starts anything
                 while (true) {
-                    var cmd: [1024]u8 = undefined;
-                    const choice = common.menu.run(c, &cfg, &cmd) orelse break;
+                    var cmd: [common.menu.max_cmdline]u8 = undefined;
+                    const result = common.menu.run(c, &cfg, &cmd, failed) orelse break;
+                    failed = true;
+                    const choice = switch (result) {
+                        .boot => |choice| choice,
+                        .manual => {
+                            var pbuf: [256]u8 = undefined;
+                            if (common.menu.manualPrompt(c, .chosen, &pbuf, &cmd)) |r| {
+                                bootLinux(&set, f.vol, r.path, &.{}, null, null, r.cmdline) catch {};
+                                say("\r\nBoot failed. Press a key.", .{});
+                                _ = c.getKey(null);
+                            }
+                            continue;
+                        },
+                    };
                     const entry = cfg.entries[choice.index];
                     switch (entry.kind) {
                         .linux => {
@@ -325,7 +421,10 @@ export fn stage2_main() callconv(.c) noreturn {
                 say("dklilo.conf line {d}: {s}\r\n", .{ diag.line, @errorName(e) });
                 _ = c.getKey(3000);
             }
-        } else |_| {}
+        } else |e| {
+            say("cannot read {s}: {s}\r\n", .{ f.path, @errorName(e) });
+            _ = c.getKey(3000);
+        }
     }
     manual(&set, c);
     halt();

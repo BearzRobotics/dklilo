@@ -111,23 +111,29 @@ pub fn setHighlight(on: bool) void {
     serialStr(if (on) "\x1b[7m" else "\x1b[0m");
 }
 
+const last_row = 24;
+
+/// To the start of the next line, scrolling the screen up at the bottom.
+fn newline() void {
+    screen_col = 0;
+    if (screen_row < last_row) {
+        screen_row += 1;
+        return;
+    }
+    _ = rm.int(0x10, .{ .eax = 0x0601, .ebx = @as(u32, 0x07) << 8, .ecx = 0, .edx = 0x184F });
+}
+
 pub fn puts(s: []const u8) void {
     for (s) |c| {
         serialByte(c);
         switch (c) {
             '\r' => screen_col = 0,
-            '\n' => {
-                screen_row = @min(screen_row + 1, 24);
-                screen_col = 0;
-            },
+            '\n' => newline(),
             else => {
                 gotoXY(screen_row, screen_col);
                 putCell(c);
                 screen_col += 1;
-                if (screen_col >= 80) {
-                    screen_col = 0;
-                    screen_row = @min(screen_row + 1, 24);
-                }
+                if (screen_col >= 80) newline();
             },
         }
     }
@@ -184,9 +190,16 @@ fn serialEscape() Key {
     }
 }
 
+/// The last byte read was a carriage return.
+var after_return = false;
+
 fn serialKey() ?Key {
     if (!serialReady()) return null;
     const c = inb(com1);
+    // A terminal that sends CR LF means one Enter.
+    const second_half = after_return and c == '\n';
+    after_return = c == '\r';
+    if (second_half) return null;
     return switch (c) {
         '\r', '\n' => .enter,
         0x7F, 0x08 => .backspace,
@@ -219,7 +232,7 @@ fn keyboardKey() ?Key {
         0x08 => .backspace,
         '\t' => .tab,
         0x20...0x7E => .{ .char = ascii },
-        else => null,
+        else => .other,
     };
 }
 
