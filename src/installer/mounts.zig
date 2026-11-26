@@ -98,6 +98,16 @@ fn parseLine(arena: std.mem.Allocator, line: []const u8) !?Mount {
     };
 }
 
+/// Every mount in the table. The results refer to `text` and to `arena`.
+pub fn list(arena: std.mem.Allocator, text: []const u8) ![]Mount {
+    var all: std.ArrayList(Mount) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (try parseLine(arena, line)) |m| try all.append(arena, m);
+    }
+    return all.items;
+}
+
 /// The mount holding the absolute path `dir`: the one with the longest mount
 /// point that contains it, and of equal ones the last (it covers the others).
 /// The result refers to `text` and to memory from `arena`.

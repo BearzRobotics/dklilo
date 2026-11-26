@@ -32,6 +32,9 @@ const heap_addr: usize = 0x2000000;
 const heap_size: usize = 8 * 1024 * 1024;
 const initrd_floor: u64 = heap_addr + heap_size;
 
+/// Where the installer says the configuration is; in `realmode.zig`.
+extern const config_record: [common.bootrecord.size]u8;
+
 extern const __bss_start: u8;
 extern const __bss_end: u8;
 
@@ -381,7 +384,16 @@ export fn stage2_main() callconv(.c) noreturn {
     };
     _ = set.addDisk(disk.blockDev()) catch halt();
 
-    const found = set.findConfig(null);
+    // The partition recorded at install first, then any on the boot disk.
+    const record = common.bootrecord.Record.decode(&config_record);
+    var found = set.findRecordedConfig(record, 0);
+    if (found == null) {
+        if (record != .none) {
+            say("no configuration on the partition recorded at install; searching\r\n", .{});
+            _ = c.getKey(3000);
+        }
+        found = set.findConfig(null);
+    }
     if (found == null) reportProbeErrors(&set, c);
     if (found) |f| {
         if (set.readFile(f.vol, f.path)) |text| {

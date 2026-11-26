@@ -6,6 +6,7 @@
 const std = @import("std");
 const blockdev = @import("blockdev.zig");
 const part = @import("part.zig");
+const bootrecord = @import("bootrecord.zig");
 const devio = @import("devio.zig");
 const fsread = @import("fsread");
 const fs_mod = fsread.fs;
@@ -244,26 +245,50 @@ pub const Set = struct {
         return std.ascii.eqlIgnoreCase(&s, value);
     }
 
+    pub const Found = struct { vol: *Volume, path: []const u8 };
+
+    const esp_config = "/EFI/dklilo/dklilo.conf";
+    const config_paths = [_][]const u8{ "/boot/dklilo.conf", "/dklilo.conf" };
+
+    fn fileOn(fs: *fs_mod.Fs, paths: []const []const u8) ?[]const u8 {
+        for (paths) |p| {
+            const file = fs.lookup(p) catch continue;
+            if (file.is_regular) return p;
+        }
+        return null;
+    }
+
+    /// The configuration on one volume, if it has one.
+    pub fn configOn(self: *Set, v: *Volume) ?[]const u8 {
+        const fs = v.filesystem(self.allocator) orelse return null;
+        if (fs.* == .fat) if (fileOn(fs, &.{esp_config})) |p| return p;
+        return fileOn(fs, &config_paths);
+    }
+
+    /// The configuration on the partition of `disk` that the installer
+    /// recorded, or null if the record leads to none.
+    pub fn findRecordedConfig(self: *Set, record: bootrecord.Record, disk: usize) ?Found {
+        for (self.vols.items) |*v| {
+            if (v.disk != disk or !record.matches(v)) continue;
+            if (self.configOn(v)) |path| return .{ .vol = v, .path = path };
+        }
+        return null;
+    }
+
     /// Finds `dklilo.conf`. The EFI System Partition's `\EFI\dklilo\dklilo.conf`
     /// wins; otherwise each volume is tried for `/boot/dklilo.conf` then
     /// `/dklilo.conf`. `disk` limits the search to one disk (the boot disk).
-    pub fn findConfig(self: *Set, disk: ?usize) ?struct { vol: *Volume, path: []const u8 } {
-        const esp_path = "/EFI/dklilo/dklilo.conf";
+    pub fn findConfig(self: *Set, disk: ?usize) ?Found {
         for (self.vols.items) |*v| {
             if (disk) |d| if (v.disk != d) continue;
             const fs = v.filesystem(self.allocator) orelse continue;
             if (fs.* != .fat) continue;
-            const ino = fs.lookup(esp_path) catch continue;
-            if (ino.is_regular) return .{ .vol = v, .path = esp_path };
+            if (fileOn(fs, &.{esp_config})) |path| return .{ .vol = v, .path = path };
         }
-        const paths = [_][]const u8{ "/boot/dklilo.conf", "/dklilo.conf" };
         for (self.vols.items) |*v| {
             if (disk) |d| if (v.disk != d) continue;
             const fs = v.filesystem(self.allocator) orelse continue;
-            for (paths) |p| {
-                const ino = fs.lookup(p) catch continue;
-                if (ino.is_regular) return .{ .vol = v, .path = p };
-            }
+            if (fileOn(fs, &config_paths)) |path| return .{ .vol = v, .path = path };
         }
         return null;
     }

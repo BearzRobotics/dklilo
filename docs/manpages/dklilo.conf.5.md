@@ -27,7 +27,11 @@ kernel path and command line.
 
 ## FINDING THE FILE
 
-The loader tries, in order:
+The BIOS loader first looks on the partition that `dklilo install-bios`
+recorded, for `\EFI\dklilo\dklilo.conf` (on FAT), `/boot/dklilo.conf`, then
+`/dklilo.conf`. If none is there it says so and goes on as below.
+
+Both loaders then try, in order:
 
 1. `\EFI\dklilo\dklilo.conf` on every FAT volume of the boot disk;
 2. `/boot/dklilo.conf`, then `/dklilo.conf`, on every volume of the boot disk;

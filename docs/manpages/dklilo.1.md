@@ -6,7 +6,7 @@ dklilo - install and check the dklilo boot loader
 
 **dklilo check** [*conf*] [**--device** *DEV*]
 
-**dklilo install-bios** *disk* [**--force**] [**--yes**]
+**dklilo install-bios** *disk* [**--config-partition** *N*|**none**] [**--force**] [**--yes**]
 
 **dklilo install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable** [**--force**]] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
 
@@ -64,7 +64,7 @@ System Partition, list the writes first and ask for confirmation (see
     searches (see FILES in **dklilo.conf**(5)), only that disk is read, and
     *conf* is not used.
 
-**install-bios** *disk* [**--force**] [**--yes**]
+**install-bios** *disk* [**--config-partition** *N*|**none**] [**--force**] [**--yes**]
 :   Installs stage 1 into the MBR boot code of *disk* and stage 2 into the gap
     before the first partition (MBR) or into the BIOS boot partition, type
     EF02 (GPT), wherever that is. The partition table is preserved. It refuses
@@ -73,6 +73,15 @@ System Partition, list the writes first and ask for confirmation (see
     byte, if a GPT disk has no BIOS boot partition, if there is not enough
     room, or if the space for stage 2 holds anything other than zeros or an
     earlier dklilo.
+
+    It also records in stage 2 which partition holds `dklilo.conf`, and the
+    loader looks there first (and searches as before if it finds none there).
+    Without **--config-partition** it takes, of the partitions of *disk* that
+    have one: the one mounted at `/boot` or `/` of the running system; else
+    the only one mounted; else the only one; else the one recorded last time.
+    If that settles nothing, nothing is recorded and a note lists them. The
+    plan shown before writing says which. Run it again after moving the
+    configuration to another partition.
 
     An earlier stage 2 owns the sectors recorded in the MBR block list, and
     what follows them must be zeros. A longer earlier stage 2 is zeroed
@@ -143,6 +152,10 @@ System Partition, list the writes first and ask for confirmation (see
     `EFI/BOOT/BOOT<ARCH>.EFI` that is not dklilo's. No copy is kept.
 
 :   (**config**) Overwrite an existing **-o** file.
+
+**--config-partition** *N*|**none**
+:   (**install-bios**) Record partition *N* of *disk* as the one holding
+    `dklilo.conf`, or record none.
 
 **--arch** *ARCH*
 :   (**install-uefi**, **mkiso-images**) Which UEFI loader to install:

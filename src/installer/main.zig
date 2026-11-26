@@ -1,7 +1,7 @@
 //! `dklilo`: installs and checks the boot loader. Static, no libc.
 //!
 //!   dklilo check [conf] [--device DEV]
-//!   dklilo install-bios <disk> [--force] [--yes]
+//!   dklilo install-bios <disk> [--config-partition N|none] [--force] [--yes]
 //!   dklilo install-uefi <esp-dir> [--removable [--force]] [--entry-file F] [--device DEV] [--yes]
 //!   dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
 //!   dklilo mkiso-images <dir>
@@ -76,7 +76,7 @@ fn usage() u8 {
     err(
         \\usage:
         \\  dklilo check [conf] [--device DEV]
-        \\  dklilo install-bios <disk> [--force] [--yes]
+        \\  dklilo install-bios <disk> [--config-partition N|none] [--force] [--yes]
         \\  dklilo install-uefi <esp-dir> [--arch ARCH] [--removable [--force]] [--entry-file FILE] [--device DEV] [--yes]
         \\  dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
         \\  dklilo mkiso-images <dir> [--arch ARCH]
@@ -172,11 +172,25 @@ fn installBios(args: []const [:0]const u8) !u8 {
     var disk_path: ?[:0]const u8 = null;
     var yes = false;
     var force = false;
-    for (args) |a| {
+    var config_choice: ConfigChoice = .automatic;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
         if (std.mem.eql(u8, a, "--yes")) {
             yes = true;
         } else if (std.mem.eql(u8, a, "--force")) {
             force = true;
+        } else if (std.mem.eql(u8, a, "--config-partition") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "none")) {
+                config_choice = .none;
+            } else {
+                const n = std.fmt.parseInt(u8, args[i], 10) catch return usage();
+                config_choice = .{ .partition = n };
+            }
+        } else if (std.mem.eql(u8, a, "--mountinfo") and i + 1 < args.len) {
+            i += 1;
+            mountinfo_override = args[i];
         } else if (disk_path == null and !isOption(a)) disk_path = a else return usage();
     }
     const path = disk_path orelse return usage();
@@ -240,10 +254,14 @@ fn installBios(args: []const [:0]const u8) !u8 {
         return 1;
     };
 
+    const found = (try configRecord(path, config_choice, p.previous_record)) orelse return 1;
+    plan.setConfigRecord(padded, found.record);
+
     out("Installing the BIOS boot loader on {s}:\n", .{path});
     const writes = p.writes();
     for (writes) |w| out("  write {s}: offset {d}, {d} bytes\n", .{ w.what, w.offset, w.data.len });
     out("  stage 2 at LBA {d} ({d} sectors)\n", .{ p.stage2_lba, p.stage2_sectors });
+    out("{s}", .{found.note});
     const cleared = p.writes()[0].data.len / plan.sector_size - p.stage2_sectors;
     if (cleared > 0) out("  note: the write also zeroes {d} more sectors left by a longer older stage 2\n", .{cleared});
     if (p.replaces_boot_code) out("  note: the existing MBR boot code will be replaced\n", .{});
@@ -265,6 +283,102 @@ fn installBios(args: []const [:0]const u8) !u8 {
     }
     out("Done.\n", .{});
     return 0;
+}
+
+const ConfigChoice = union(enum) { automatic, none, partition: u8 };
+
+/// What to record about where `dklilo.conf` is, and the line that says so.
+/// Null if it can't be done as asked (reported).
+fn configRecord(disk_path: []const u8, choice: ConfigChoice, previous: common.bootrecord.Record) !?struct {
+    record: common.bootrecord.Record,
+    note: []const u8,
+} {
+    if (choice == .none) return .{ .record = .none, .note = "  configuration: not recorded; the loader will search for it\n" };
+    var disks: Disks = .{};
+    defer disks.deinit();
+    var set = common.volumes.Set.init(gpa_global);
+    defer set.deinit();
+    _ = disks.add(&set, disk_path) catch |e| {
+        err("dklilo: cannot read {s}: {s}\n", .{ disk_path, @errorName(e) });
+        return null;
+    };
+
+    if (choice == .partition) {
+        const vol = set.findPartition(0, choice.partition) orelse {
+            err("dklilo: {s} has no partition {d}\n", .{ disk_path, choice.partition });
+            return null;
+        };
+        return .{
+            .record = .of(vol),
+            .note = try std.fmt.allocPrint(arena_global, "  configuration: recorded as partition {d}\n", .{choice.partition}),
+        };
+    }
+
+    var candidates: std.ArrayList(plan.Candidate) = .empty;
+    var mounted: [256]bool = @splat(false);
+    try addMountedConfigs(disk_path, &set, &candidates, &mounted);
+    // The rest are read as the loader would read them. (A mounted one isn't:
+    // what is on the disk beneath it may be behind.)
+    for (set.vols.items) |*v| {
+        if (v.number == 0 or mounted[v.number] or set.configOn(v) == null) continue;
+        try candidates.append(arena_global, .{ .number = v.number, .record = .of(v) });
+    }
+    if (plan.chooseConfig(candidates.items, previous)) |c| return .{
+        .record = c.record,
+        .note = try std.fmt.allocPrint(arena_global, "  configuration: recorded as partition {d}\n", .{c.number}),
+    };
+    if (candidates.items.len == 0) return .{
+        .record = .none,
+        .note = "  note: no dklilo.conf found on this disk; the loader will search for it at boot\n",
+    };
+    var numbers: Io.Writer.Allocating = .init(arena_global);
+    for (candidates.items, 0..) |c, n| {
+        try numbers.writer.print("{s}{d}", .{ if (n == 0) "" else ", ", c.number });
+    }
+    return .{
+        .record = .none,
+        .note = try std.fmt.allocPrint(arena_global, "  note: dklilo.conf is on partitions {s}; none is recorded, so the loader takes the first.\n" ++
+            "        Choose one with --config-partition N.\n", .{numbers.written()}),
+    };
+}
+
+/// Adds the configurations seen through the mounted filesystems of the disk,
+/// and marks which of its partitions are mounted.
+fn addMountedConfigs(
+    disk_path: []const u8,
+    set: *common.volumes.Set,
+    candidates: *std.ArrayList(plan.Candidate),
+    mounted: *[256]bool,
+) !void {
+    const text = readStreamed(mountinfoPath()) catch return;
+    const disk = canonical(disk_path);
+    for (try mounts.list(arena_global, text)) |m| {
+        const source = m.device() orelse continue;
+        const p = (findPartition(source) catch continue) orelse continue;
+        if (!std.mem.eql(u8, canonical(p.disk), disk)) continue;
+        const vol = set.findPartition(0, std.math.cast(u8, p.number) orelse continue) orelse continue;
+        mounted[vol.number] = true;
+        // Only the top of the filesystem (or of a subvolume) shows the paths
+        // the loader looks for.
+        if ((try m.pathOf(arena_global, m.point)).len != 0) continue;
+        const esp = std.mem.eql(u8, m.fstype, "vfat") or std.mem.eql(u8, m.fstype, "msdos");
+        const names = [_][]const u8{ "boot/dklilo.conf", "dklilo.conf", "EFI/dklilo/dklilo.conf" };
+        const has_config = for (names[0..if (esp) 3 else 2]) |name| {
+            const file = try std.fs.path.join(arena_global, &.{ m.point, name });
+            // Not one that another filesystem, mounted below, supplies.
+            const holder = (try mounts.find(arena_global, text, file)) orelse continue;
+            if (!std.mem.eql(u8, holder.point, m.point)) continue;
+            const stat = Io.Dir.cwd().statFile(io_global, file, .{}) catch continue;
+            if (stat.kind == .file) break true;
+        } else false;
+        if (!has_config) continue;
+        const running: u2 = if (std.mem.eql(u8, m.point, "/boot")) 2 else if (std.mem.eql(u8, m.point, "/")) 1 else 0;
+        for (candidates.items) |*c| {
+            if (c.number != vol.number) continue;
+            c.running = @max(c.running, running);
+            break;
+        } else try candidates.append(arena_global, .{ .number = vol.number, .record = .of(vol), .running = running, .mounted = true });
+    }
 }
 
 // ---- install-uefi ----------------------------------------------------------
@@ -608,19 +722,6 @@ fn check(args: []const [:0]const u8) !u8 {
         return 0;
     }
     out("{d} entries, labels unique, default '{s}'\n", .{ cfg.entries.len, cfg.entries[cfg.defaultIndex()].label });
-
-    if (device == null) {
-        // LABEL=, UUID= and PARTUUID= may name another disk.
-        if (usesVolumePrefix(cfg)) disks.addLocal(&set);
-        // Only now that no more volumes are added does a pointer to one last.
-        default_vol = for (set.vols.items) |*v| {
-            if (v.disk == 0 and (partition_number == null or v.number == partition_number.?)) break v;
-        } else {
-            err("dklilo: cannot find the filesystem that holds the configuration\n", .{});
-            return 1;
-        };
-    }
-
     // A mounted filesystem always looks like this; an unmounted one shouldn't.
     if (device != null) if (default_vol.filesystem(gpa_global)) |fs| {
         if (fs.needsRecovery()) out("warn: the configuration's filesystem was not unmounted cleanly; the loader may see older files\n", .{});

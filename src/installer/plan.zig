@@ -54,6 +54,8 @@ pub const BiosPlan = struct {
     mbr: [sector_size]u8,
     /// True if the old MBR held boot code that will be replaced.
     replaces_boot_code: bool,
+    /// What an older dklilo stage 2 there recorded about the configuration.
+    previous_record: common.bootrecord.Record,
     /// What is written at `stage2_lba` (lives in the caller's buffer): stage 2
     /// padded to whole sectors, then zeros over the rest of a longer older one.
     stage2_padded: []const u8,
@@ -186,7 +188,9 @@ pub fn planBios(
     const target = sectorsAt(head, far, lba, sectors) orelse return error.NoRoom;
     var older: u32 = 0; // sectors known to hold an older stage 2
     var unrecorded = false;
+    var previous_record: common.bootrecord.Record = .none;
     if (std.mem.eql(u8, target[2..10], stage2_magic)) {
+        previous_record = .decode(target[common.bootrecord.offset..][0..common.bootrecord.size]);
         if (recordedStage2(head[0..sector_size], lba)) |n| {
             // A record reaching past the space or the buffer is not believed.
             if (n <= room and sectorsAt(head, far, lba, n) != null) older = n else unrecorded = true;
@@ -218,6 +222,7 @@ pub fn planBios(
         .stage2_sectors = sectors,
         .mbr = mbr,
         .replaces_boot_code = replaces,
+        .previous_record = previous_record,
         .stage2_padded = stage2_buf[0 .. written * sector_size],
     };
 }
@@ -230,6 +235,41 @@ const stage1_prologue = [_]u8{ 0xFA, 0x31, 0xC0, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0
 /// Is this MBR code area dklilo's stage 1?
 pub fn looksLikeStage1(code: []const u8) bool {
     return std.mem.startsWith(u8, code, &stage1_prologue);
+}
+
+/// Fills in where the configuration is, in the stage 2 about to be written
+/// (`stage2_buf` as given to `planBios`).
+pub fn setConfigRecord(stage2_buf: []u8, config: common.bootrecord.Record) void {
+    config.encode(stage2_buf[common.bootrecord.offset..][0..common.bootrecord.size]);
+}
+
+/// A partition of the target disk that holds a configuration.
+pub const Candidate = struct {
+    number: u8,
+    record: common.bootrecord.Record,
+    /// Mounted at `/boot` (2) or `/` (1) of the running system; else 0.
+    running: u2 = 0,
+    mounted: bool = false,
+};
+
+/// Which partition to record: the running system's `/boot` or `/`; else the
+/// only one mounted (an installer's target); else the only one there is; else
+/// the one recorded last time. Null if none of these settles it.
+pub fn chooseConfig(candidates: []const Candidate, previous: common.bootrecord.Record) ?Candidate {
+    var best: ?Candidate = null;
+    for (candidates) |c| if (c.running > 0 and (best == null or c.running > best.?.running)) {
+        best = c;
+    };
+    if (best != null) return best;
+    var mounted: usize = 0;
+    for (candidates) |c| if (c.mounted) {
+        mounted += 1;
+        best = c;
+    };
+    if (mounted == 1) return best;
+    if (candidates.len == 1) return candidates[0];
+    for (candidates) |c| if (previous != .none and std.meta.eql(c.record, previous)) return c;
+    return null;
 }
 
 // ---- the loader already on removable media ---------------------------------
@@ -518,4 +558,40 @@ test "EFI_LOAD_OPTION layout" {
     try testing.expectEqual(@as(u8, 4), path[42]); // file path node
     try testing.expectEqual(@as(u8, 4), path[43]);
     try testing.expectEqual(@as(u8, 0x7F), path[path.len - 4]); // end node
+}
+
+test "which configuration partition gets recorded" {
+    const rec = struct {
+        fn mbr(n: u8) common.bootrecord.Record {
+            return .{ .mbr = .{ .signature = 1, .number = n } };
+        }
+    };
+    const one: Candidate = .{ .number = 1, .record = rec.mbr(1) };
+    var two: Candidate = .{ .number = 2, .record = rec.mbr(2) };
+    try testing.expect(chooseConfig(&.{}, .none) == null);
+    try testing.expectEqual(@as(u8, 1), chooseConfig(&.{one}, rec.mbr(2)).?.number);
+    try testing.expect(chooseConfig(&.{ one, two }, .none) == null);
+    try testing.expectEqual(@as(u8, 2), chooseConfig(&.{ one, two }, rec.mbr(2)).?.number);
+    two.mounted = true; // a mounted target counts for more than the last record
+    try testing.expectEqual(@as(u8, 2), chooseConfig(&.{ one, two }, rec.mbr(1)).?.number);
+    var root_one = one; // and the running system's /boot for more than its /
+    root_one.running = 1;
+    root_one.mounted = true;
+    two.running = 2;
+    try testing.expectEqual(@as(u8, 2), chooseConfig(&.{ root_one, two }, rec.mbr(1)).?.number);
+}
+
+test "the record goes into stage 2, and an older one is read back" {
+    var disk = mbrDisk(2048);
+    const s1 = fakeStage1();
+    var s2_buf: [4096]u8 = undefined;
+    const s2 = fakeStage2(3000, &s2_buf);
+    var padded: [max_stage2_sectors * sector_size]u8 = undefined;
+    const wanted: common.bootrecord.Record = .{ .mbr = .{ .signature = 0xCAFEBABE, .number = 1 } };
+    const first = try planBios(&disk, &s1, s2, &padded, false, null);
+    try testing.expect(first.previous_record == .none);
+    setConfigRecord(&padded, wanted);
+    for (first.writes()) |w| @memcpy(disk[@intCast(w.offset)..][0..w.data.len], w.data);
+    const again = try planBios(&disk, &s1, s2, &padded, false, null);
+    try testing.expectEqualDeep(wanted, again.previous_record);
 }

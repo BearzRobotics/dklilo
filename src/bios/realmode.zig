@@ -93,8 +93,11 @@ comptime {
         \\ .intel_syntax noprefix
         \\ .global _start
         \\ _start:
-        \\   .byte 0xEB, 0x08       # jmp over the signature below; the installer
-        \\   .ascii "DKLILOS2"      # recognises an installed stage 2 by it
+        \\   .byte 0xEB, 0x20       # jmp over the signature and the record below
+        \\   .ascii "DKLILOS2"      # the installer recognises a stage 2 by it
+        \\   .global config_record  # 24 bytes at offset 10 that the installer
+        \\ config_record:           # fills in (src/common/bootrecord.zig)
+        \\   .zero 24
         \\   cli
         \\   cld                    # the code Zig generates assumes DF = 0
         \\   xor ax, ax

@@ -440,6 +440,12 @@ Details settled while building L0-L3 that the sections above leave open.
   `0x1F00000`, an 8 MiB heap at `0x2000000`. The initramfs goes as high as the
   E820 map and `initrd_addr_max` allow, never below the end of the heap.
   Machines need roughly 41 MiB of RAM or more.
+- **Configuration record (5.3).** Stage 2 holds it: 24 bytes at offset 10,
+  after its jump and `DKLILOS2` signature (`src/common/bootrecord.zig`), filled
+  in by `install-bios`. The MBR has only 14 bytes to spare, too few for a
+  GUID. With several configurations on the disk the installer takes the one
+  on the running system's `/boot` or `/`, else on the only mounted partition,
+  else the one recorded before; `--config-partition` decides otherwise.
 - **BIOS memory checks.** Before using the stack and heap, stage 2 checks that
   the E820 map says they are usable RAM, and otherwise stops with a message.
   It refuses a kernel whose protected-mode part is over 29 MiB (loading it

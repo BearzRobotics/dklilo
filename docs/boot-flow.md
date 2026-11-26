@@ -40,8 +40,9 @@ command proves a configuration with the code that will boot it.
 5. **Finding the configuration.** Stage 2 asks the BIOS for the boot drive's
    geometry (`int 13h ah=48h`), reads its partition table (MBR with extended
    partitions, or GPT) and probes each partition for ext2/3/4, btrfs, FAT or
-   ISO 9660. It looks for `\EFI\dklilo\dklilo.conf` on FAT volumes, then
-   `/boot/dklilo.conf` and `/dklilo.conf`. No configuration, or a broken one,
+   ISO 9660. It looks first on the partition `install-bios` recorded inside
+   stage 2. Failing that, it looks for `\EFI\dklilo\dklilo.conf` on FAT
+   volumes, then `/boot/dklilo.conf` and `/dklilo.conf`. No configuration, or a broken one,
    leads to a prompt where a kernel path and command line can be typed.
 6. **The menu** draws on the screen and on COM1 at the same time and reads
    keys from both.

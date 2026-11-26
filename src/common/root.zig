@@ -9,6 +9,7 @@ pub const config = @import("config.zig");
 pub const console = @import("console.zig");
 pub const menu = @import("menu.zig");
 pub const volumes = @import("volumes.zig");
+pub const bootrecord = @import("bootrecord.zig");
 pub const bootparams = @import("linux/bootparams.zig");
 pub const lzo = fsread.lzo;
 pub const part = @import("part.zig");
@@ -25,6 +26,7 @@ test {
     _ = console;
     _ = menu;
     _ = volumes;
+    _ = bootrecord;
     _ = bootparams;
     _ = part;
     _ = @import("tests.zig");
