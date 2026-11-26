@@ -1,6 +1,7 @@
 //! `dklilo`: installs and checks the boot loader. Static, no libc.
 //!
 //!   dklilo check [conf] [--device DEV]
+//!   dklilo password [--iterations N]
 //!   dklilo install-bios <disk> [--config-partition N|none] [--force] [--yes]
 //!   dklilo install-uefi <esp-dir> [--removable [--force]] [--entry-file F] [--device DEV] [--yes]
 //!   dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
@@ -76,6 +77,7 @@ fn usage() u8 {
     err(
         \\usage:
         \\  dklilo check [conf] [--device DEV]
+        \\  dklilo password [--iterations N]
         \\  dklilo install-bios <disk> [--config-partition N|none] [--force] [--yes]
         \\  dklilo install-uefi <esp-dir> [--arch ARCH] [--removable [--force]] [--entry-file FILE] [--device DEV] [--yes]
         \\  dklilo config [--boot DIR] [-o FILE] [--force] [--root DEV] [--append STR] [--no-windows]
@@ -745,9 +747,11 @@ fn check(args: []const [:0]const u8) !u8 {
     };
     var problems: u32 = 0;
     if (!cfg.passwordUsable()) {
-        err("FAIL: password is not a SHA-256 hash in hexadecimal: nobody can ever match it\n", .{});
+        err("FAIL: password is not a hash that any password can match (see `dklilo password`)\n", .{});
         problems += 1;
-    }
+    } else if (cfg.password) |hash| if (common.password.isUnsalted(hash)) {
+        out("warn: password: an unsalted SHA-256 hash is quick to guess; `dklilo password` makes a better one\n", .{});
+    };
     var any_restricted = false;
     for (cfg.entries) |e| if (e.restricted) {
         any_restricted = true;
@@ -923,6 +927,92 @@ const Disks = struct {
         for (self.list.items) |d| d.device.close();
     }
 };
+
+// ---- password ---------------------------------------------------------------
+
+/// The loaders take printable ASCII, up to this many characters.
+const max_typed_password = 256;
+
+/// Reads one line of standard input into `buf`, without echoing it when that
+/// is a terminal.
+fn readPassword(buf: []u8, terminal: bool, prompt: []const u8) ![]u8 {
+    const stdin = std.posix.STDIN_FILENO;
+    var old: std.posix.termios = undefined;
+    if (terminal) {
+        old = try std.posix.tcgetattr(stdin);
+        var quiet = old;
+        quiet.lflag.ECHO = false;
+        err("{s}", .{prompt});
+        try std.posix.tcsetattr(stdin, .FLUSH, quiet);
+    }
+    defer if (terminal) {
+        std.posix.tcsetattr(stdin, .FLUSH, old) catch {};
+        err("\n", .{});
+    };
+    // A byte at a time, so that nothing past this line is taken.
+    var n: usize = 0;
+    while (true) {
+        var byte: [1]u8 = undefined;
+        if (try std.posix.read(stdin, &byte) == 0 or byte[0] == '\n') break;
+        if (n == buf.len) return error.PasswordTooLong;
+        buf[n] = byte[0];
+        n += 1;
+    }
+    if (n > 0 and buf[n - 1] == '\r') n -= 1;
+    return buf[0..n];
+}
+
+fn passwordCmd(args: []const [:0]const u8) !u8 {
+    var iterations: u32 = common.password.default_iterations;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--iterations") and i + 1 < args.len) {
+            i += 1;
+            iterations = std.fmt.parseInt(u32, args[i], 10) catch return usage();
+            if (iterations == 0 or iterations > common.password.max_iterations) {
+                err("dklilo: --iterations must be from 1 to {d}\n", .{common.password.max_iterations});
+                return 2;
+            }
+        } else return usage();
+    }
+    const terminal = if (std.posix.tcgetattr(std.posix.STDIN_FILENO)) |_| true else |_| false;
+    // One byte more than allowed shows that it is too long.
+    var first: [max_typed_password + 1]u8 = undefined;
+    var again: [max_typed_password + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &first);
+    defer std.crypto.secureZero(u8, &again);
+    const typed = readPassword(&first, terminal, "Password: ") catch |e| {
+        err("dklilo: cannot read the password: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (typed.len == 0 or typed.len > max_typed_password) {
+        err("dklilo: the password must be 1 to {d} characters\n", .{max_typed_password});
+        return 1;
+    }
+    for (typed) |c| if (c < 0x20 or c > 0x7E) {
+        err("dklilo: only printable ASCII characters can be typed at the boot menu\n", .{});
+        return 1;
+    };
+    if (terminal) {
+        const repeated = readPassword(&again, true, "Again:    ") catch "";
+        if (!std.mem.eql(u8, typed, repeated)) {
+            err("dklilo: the two passwords differ\n", .{});
+            return 1;
+        }
+    }
+    var salt: [16]u8 = undefined;
+    io_global.randomSecure(&salt) catch |e| {
+        err("dklilo: cannot get random bytes: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    var line: [common.password.max_len]u8 = undefined;
+    const hash = common.password.format(&line, typed, &salt, iterations) catch unreachable;
+    out("password = {s}\n", .{hash});
+    err("Put this line before the first entry of dklilo.conf. First make sure the installed\n" ++
+        "boot loader is this version or newer: an older one treats the line as a broken\n" ++
+        "configuration, which brings up a prompt without a password.\n", .{});
+    return 0;
+}
 
 // ---- config ----------------------------------------------------------------
 
@@ -1253,6 +1343,7 @@ pub fn main(init: std.process.Init) !u8 {
     const cmd = args[1];
     const rest = args[2..];
     if (std.mem.eql(u8, cmd, "check")) return check(rest);
+    if (std.mem.eql(u8, cmd, "password")) return passwordCmd(rest);
     if (std.mem.eql(u8, cmd, "install-bios")) return installBios(rest);
     if (std.mem.eql(u8, cmd, "install-uefi")) return installUefi(rest);
     if (std.mem.eql(u8, cmd, "config")) return configCmd(rest);

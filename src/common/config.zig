@@ -7,6 +7,7 @@
 //! input must outlive the `Config`.
 
 const std = @import("std");
+const password = @import("password.zig");
 
 pub const Error = error{
     /// A line that isn't `key = value`, a bad number, or a bad quote.
@@ -73,7 +74,7 @@ pub const Config = struct {
     default: ?[]const u8 = null,
     prompt: bool = false,
     serial: ?Serial = null,
-    /// Lowercase hex SHA-256 of the editing password.
+    /// The password's hash, in either form `password.zig` describes.
     password: ?[]const u8 = null,
     entries: []Entry = &.{},
 
@@ -91,14 +92,12 @@ pub const Config = struct {
         return 0;
     }
 
-    /// Whether `password` is 64 hex digits. The parser only checks the
-    /// length: a loader that rejected such a file would drop to the manual
-    /// prompt with no password at all, whereas one that can never be matched
+    /// Whether some password could match `password`. The parser checks only
+    /// which form it is: a loader that rejected the file would drop to the
+    /// manual prompt with no password at all, whereas a value nothing matches
     /// keeps everything it guards locked. `dklilo check` reports it.
     pub fn passwordUsable(self: *const Config) bool {
-        const p = self.password orelse return true;
-        for (p) |c| if (!std.ascii.isHex(c)) return false;
-        return true;
+        return password.isUsable(self.password orelse return true);
     }
 
     pub fn find(self: *const Config, label: []const u8) ?usize {
@@ -219,7 +218,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic)
             } else if (std.mem.eql(u8, key, "default")) {
                 cfg.default = value;
             } else if (std.mem.eql(u8, key, "password")) {
-                if (value.len != 64) return error.Syntax;
+                if (value.len != 64 and !std.mem.startsWith(u8, value, password.prefix)) return error.Syntax;
                 cfg.password = value;
             } else if (std.mem.eql(u8, key, "serial")) {
                 var it = std.mem.splitScalar(u8, value, ',');
@@ -418,8 +417,12 @@ test "empty config is valid (the prompt takes over)" {
     try testing.expectEqual(@as(usize, 0), c.entries.len);
 }
 
-test "password must be a 64-digit hash" {
+test "password must be a hash, in one of its forms" {
     try testing.expectError(error.Syntax, parse(testing.allocator, "password = hunter2\n", null));
+    var salted = try parse(testing.allocator, "password = pbkdf2-sha256$1000$0011223344556677$" ++
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nimage = /k\n", null);
+    defer salted.deinit();
+    try testing.expect(salted.passwordUsable());
     const hash = "abababababababababababababababababababababababababababababababab";
     var c = try parse(testing.allocator, "password = " ++ hash ++ "\nimage = /k\nrestricted\n", null);
     defer c.deinit();

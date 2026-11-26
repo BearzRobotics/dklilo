@@ -66,5 +66,15 @@ boot "an entry without an initramfs is offered none" \
 boot "a command line that isn't ASCII arrives as text" \
     "wait:dklilo boot menu" key:up key:ret "wait:unit=00e9 unit=20ac"
 
+# A salted password (CMN-04) guards booting by hand on UEFI too.
+{ printf 'prompt\n'; printf 'secret\n' | "$root/zig-out/bin/dklilo" password 2>/dev/null
+  printf 'image = /fake.efi\n    label = k\n'; } > "$d/dklilo.conf"
+mcopy -o -i "$d/esp.img" "$d/dklilo.conf" ::/EFI/dklilo/dklilo.conf
+dd if="$d/esp.img" of="$d/disk.img" bs=512 seek=2048 conv=notrunc 2>/dev/null
+boot "a salted password is checked by the UEFI loader" \
+    "wait:dklilo boot menu" key:m "wait:Password" key:x key:ret "wait:Access denied" \
+    "wait:dklilo boot menu" key:m "wait:Password" key:s key:e key:c key:r key:e key:t key:ret \
+    "wait:Kernel path"
+
 [ $failures -eq 0 ] || { echo "FAIL: $failures retry case(s)"; exit 1; }
 echo "PASS: a boot that returns leaves nothing behind"

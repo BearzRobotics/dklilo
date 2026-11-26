@@ -74,5 +74,17 @@ boot "booting by hand needs the password" locked \
     key:m "wait:Password" key:s key:e key:c key:r key:e key:t key:ret "wait:Kernel path" \
     $kernel "wait:Starting kernel"
 
+disk salted <<C
+timeout = 0
+$(printf 'secret\n' | "$dk" password 2>/dev/null)
+image = /boot/missing
+    label = broken
+C
+boot "a salted password is checked by the BIOS loader" salted \
+    "wait:Boot failed" key:ret "wait:dklilo boot menu" key:m "wait:Password" \
+    key:x key:ret "wait:Access denied" "wait:dklilo boot menu" \
+    key:m "wait:Password" key:s key:e key:c key:r key:e key:t key:ret "wait:Kernel path" \
+    $kernel "wait:Starting kernel"
+
 [ $failures -eq 0 ] || { echo "FAIL: $failures retry case(s)"; exit 1; }
 echo "PASS: a failed boot leaves a way out"

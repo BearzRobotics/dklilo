@@ -34,15 +34,42 @@ expect() {
 }
 
 hash=$(printf %s secret | sha256sum | cut -d' ' -f1)
+salted=$(printf 'secret\n' | "$dk" password 2>/dev/null)
 
 image good <<C
-password = $hash
+$salted
 image = /boot/vmlinuz
     label = linux
     restricted
 C
 expect "a good configuration passes" good pass "all files found"
 grep -qi "warn" "$d/out.txt" && bad "a good configuration draws a warning"
+
+# ---- password hashes (CMN-04) ----------------------------------------------
+image unsalted <<C
+password = $hash
+image = /boot/vmlinuz
+    label = linux
+    restricted
+C
+expect "an unsalted hash still works, with a warning" unsalted pass "unsalted"
+
+# The command's output, checked against another implementation of PBKDF2.
+if printf 'open sesame\n' | "$dk" password --iterations 1000 2>"$d/err.txt" |
+    python3 -I -c '
+import hashlib, sys
+key, eq, value = sys.stdin.read().split()
+kind, rounds, salt, want = value.split("$")
+assert (key, eq, kind, rounds, len(salt)) == ("password", "=", "pbkdf2-sha256", "1000", 32), value
+assert hashlib.pbkdf2_hmac("sha256", b"open sesame", bytes.fromhex(salt), 1000).hex() == want
+'; then echo "ok: dklilo password makes a correct PBKDF2 hash"
+else bad "dklilo password: wrong output"; fi
+grep -q "older one treats the line as a broken" "$d/err.txt" || bad "no warning about older loaders"
+a=$(printf 'x\n' | "$dk" password --iterations 5 2>/dev/null); b=$(printf 'x\n' | "$dk" password --iterations 5 2>/dev/null)
+[ -n "$a" ] && [ "$a" != "$b" ] && echo "ok: each hash gets its own salt" || bad "the same salt twice"
+for bad_input in '' 'caf\303\251' "$(printf 'x%.0s' $(seq 257))"; do
+    if printf "$bad_input\n" | "$dk" password >/dev/null 2>&1; then bad "accepted a password the loader can't take"; fi
+done
 
 # ---- passwords that don't protect what they seem to (CMN-03) ----------------
 image nothex <<C

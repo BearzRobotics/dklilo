@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const password = @import("password.zig");
 const console = @import("console.zig");
 const Console = console.Console;
 const Key = console.Key;
@@ -113,14 +114,6 @@ pub fn editLine(con: Console, row: u16, col: u16, buf: []u8, len: *usize, mask: 
             else => {},
         }
     }
-}
-
-fn passwordOk(cfg: *const config.Config, typed: []const u8) bool {
-    const want = cfg.password orelse return true;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(typed, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.ascii.eqlIgnoreCase(&hex, want);
 }
 
 /// Screen rows the menu needs besides the entries: the title and a blank, then
@@ -234,7 +227,12 @@ fn askPassword(con: Console, cfg: *const config.Config, row: u16) bool {
     con.moveTo(row, 0);
     con.puts("Password: ");
     const r = editLine(con, row, 10, &pw, &pw_len, true);
-    if (r == .accepted and passwordOk(cfg, pw[0..pw_len])) return true;
+    if (r == .accepted) {
+        con.moveTo(row + 1, 0);
+        con.puts("Checking...");
+        // No password at all means there is nothing to get wrong.
+        if (password.matches(cfg.password orelse return true, pw[0..pw_len])) return true;
+    }
     con.moveTo(row + 1, 0);
     con.puts("Access denied.");
     var ticks: u32 = 0;
@@ -425,6 +423,18 @@ test "backspace, left/right and Esc going back to the menu" {
     // Esc discarded the edit; Enter then boots b with its unedited line.
     try testing.expectEqual(@as(usize, 1), c.index);
     try testing.expectEqualStrings("single", c.cmdline);
+}
+
+test "a salted password unlocks the editor" {
+    var out: [password.max_len]u8 = undefined;
+    const hash = try password.format(&out, "open sesame", "0123456789abcdef", 10);
+    var text: [256]u8 = undefined;
+    var cfg = try config.parse(testing.allocator, try std.fmt.bufPrint(&text, "password = {s}\nimage = /k\nroot = /dev/x\nrestricted\n", .{hash}), null);
+    defer cfg.deinit();
+    const keys = [_]Key{.{ .char = 'e' }} ++ keysOf("open sesame") ++ [_]Key{.enter} ++ keysOf("!") ++ [_]Key{.enter};
+    var f = FakeConsole{ .keys = &keys };
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("root=/dev/x!", run(f.con(), &cfg, &buf, false).?.boot.cmdline);
 }
 
 test "restricted entries ask for the password" {
