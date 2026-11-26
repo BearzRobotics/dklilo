@@ -21,29 +21,29 @@
 **Regression tests:** `a FAT filesystem on a whole disk is one volume`, `a disk with an empty partition table can still hold a filesystem`, and the guard `partitions win over a boot sector left from an old FAT filesystem`.
 
 ## CMN-03: Password protection fails open
-**Severity:** High · **Status:** Partly fixed (the cases `check` can report)
+**Severity:** High · **Status:** Fixed (the reportable cases; the rest decided)
 
 - `restricted` without `password` protects nothing (`menu.zig:178`), with no error or warning.
 - `password` without `restricted` protects nothing. In LILO, a password without `restricted` guards booting the image, so a ported config silently loses protection.
 - A 64-character non-hex password is accepted (`config.zig:167-169`) and can never match.
 - A broken or unreadable config leads to the unrestricted manual prompt.
 
-**Fixed:** `dklilo check` now fails on a password that is not hexadecimal, and warns about `restricted` without `password` and `password` without `restricted`. A password also guards the new boot-by-hand menu key. The loader's parser still accepts the non-hex password on purpose: rejecting the file would lead to the unrestricted prompt, while a hash nobody can match keeps guarded actions locked.
+**Fixed:** `dklilo check` fails on a password hash that nothing could match, and warns about `restricted` without `password` and `password` without `restricted`. A password also guards the boot-by-hand menu key. The loader's parser still accepts an unusable hash on purpose: rejecting the file would lead to the unrestricted prompt, while a hash nobody can match keeps guarded actions locked.
 
-**Regression test:** `tests/qemu/l6-check.sh`; the three new cases failed on the old tool.
+**Regression test:** `tests/qemu/l6-check.sh`; the three cases first added failed on the old tool.
 
-**Decided by the maintainer (2026-11-25):** a broken configuration may bring up the prompt without a password, so that stays as it is (the same code covers an unreadable or missing one).
-
-**Open, a design decision:** `password` without `restricted` still does not guard booting an entry, unlike LILO.
+**Decided by the maintainer (2026-11-25):** a broken configuration may bring up the prompt without a password (the same code covers an unreadable or missing one); and `password` without `restricted` keeps not guarding booting, unlike LILO, so that machines can boot unattended. The manual says both, and `check` warns about the second.
 
 ## CMN-04: Weak password handling
-**Severity:** Medium · **Status:** Partly fixed
+**Severity:** Medium · **Status:** Fixed
 
 Unsalted single SHA-256 in a readable file permits fast offline guessing. The "Access denied" delay is `getKey(1500)`, which any key skips (`menu.zig:187`). Input is silently cut at 64 characters, so longer passwords never work. Buffers are not cleared.
 
-**Fixed:** typing can no longer cut short the pause after a wrong password (keys pressed during it are discarded), passwords of up to 256 characters work, and the typed password is cleared from memory. Unit tests cover the first two.
+**Fix (applied):** typing can no longer cut short the pause after a wrong password (keys pressed during it are discarded), passwords of up to 256 characters work, and the typed password is cleared from memory. The hash may now be PBKDF2-HMAC-SHA-256 with a random salt and an iteration count, made by the new `dklilo password` command (300,000 iterations by default). The unsalted form is still accepted, with a warning from `check`.
 
-**Open:** the stored hash is still a single unsalted SHA-256. Changing it changes the configuration format, which is a design decision.
+**Tests:** unit tests (one compares the output with a value computed by Python's `hashlib`), `l6-check.sh`, which also checks the command's output against `hashlib`, and salted passwords in both loaders (`l3-bios-retry.sh` and `l2-uefi-retry.sh`). In QEMU without acceleration, a 100,000-iteration check took 0.6 s in the BIOS loader, so the default should take about 2 s there; no real hardware was timed, and the UEFI check was not timed.
+
+**Behaviour to know about:** a loader older than 0.0.5 treats the new form as a broken configuration, which brings up the prompt without a password. Update the loader before the configuration.
 
 ## CMN-05: `LABEL=` and `UUID=` take the first match on any disk
 **Severity:** Medium · **Status:** Partly fixed

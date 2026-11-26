@@ -2,7 +2,7 @@
 
 Audit of commit `38d1030` (release 0.0.4), 2026-11-24. The audit itself changed no source file. Entries and line numbers describe that commit. Every fix must keep existing supported behaviour.
 
-**Progress:** 53 entries fixed, 13 partly fixed, 0 open. Partly fixed (each entry says what remains): BIOS-05, BIOS-11, BLD-02, CMN-03, CMN-04, CMN-05, CMN-06, CMN-09, FS-10, FS-12, INST-07, INST-15, UEFI-07.
+**Progress:** 55 entries fixed, 11 partly fixed, 0 open. Partly fixed (each entry says what remains): BIOS-05, BIOS-11, BLD-02, CMN-05, CMN-06, CMN-09, FS-10, FS-12, INST-07, INST-15, UEFI-07.
 
 **66 entries:** 7 critical, 20 high, 28 medium, 11 low. Many entries group several related defects.
 
@@ -51,7 +51,7 @@ See [repro/README.md](repro/README.md) to rerun the reproductions.
 | [FS-07](filesystems.md) | High | FAT first cluster 1 underflows | **Fixed**; was reproduced |
 | [CMN-01](loader-common.md) | High | A failed boot can trap the user forever | **Fixed** |
 | [CMN-02](loader-common.md) | High | Whole-disk FAT volumes are invisible | **Fixed** |
-| [CMN-03](loader-common.md) | High | Password protection fails open | **Partly fixed** |
+| [CMN-03](loader-common.md) | High | Password protection fails open | **Fixed** |
 | [UEFI-01](uefi.md) | High | One failed boot blocks later boots with an initrd | **Fixed** |
 | [UEFI-02](uefi.md) | High | A stale initrd can go to the next entry | **Fixed** |
 | [INST-04](installer.md) | High | ESP directory is mapped to the wrong partition | **Fixed** |
@@ -74,7 +74,7 @@ See [repro/README.md](repro/README.md) to rerun the reproductions.
 | [FS-11](filesystems.md) | Medium | Unknown or unreplayed on-disk state is read silently | **Fixed** |
 | [FS-12](filesystems.md) | Medium | ext4 checksum verification can be skipped | **Partly fixed** |
 | [FS-14](filesystems.md) | Medium | Compatibility bugs | **Fixed** |
-| [CMN-04](loader-common.md) | Medium | Weak password handling | **Partly fixed** |
+| [CMN-04](loader-common.md) | Medium | Weak password handling | **Fixed** |
 | [CMN-05](loader-common.md) | Medium | `LABEL=` and `UUID=` take the first match on any disk | **Partly fixed** |
 | [CMN-06](loader-common.md) | Medium | Volume probe errors are hidden and permanent | **Partly fixed** |
 | [CMN-07](loader-common.md) | Medium | Partition values overflow | **Fixed** |
@@ -118,9 +118,9 @@ The report is complete.
 - FS-03 to FS-07, BIOS-02 and BIOS-03 are fixed; each entry records its tests and limits. All 18 new damaged-metadata tests failed on the old readers (some only in the new 32-bit build), and both new BIOS scripts failed on the old loader. With the fixes, `zig build test` passed (92 passed and 1 skipped as 64-bit (the skipped test applies only to 32-bit), all 93 passed as 32-bit, and 26 installer tests) and all 22 QEMU scripts passed, including the AArch64 and RISC-V Linux boots. Nothing was tried on real hardware.
 - Every remaining entry has since been worked through; each records what was reproduced, how it was fixed, its tests and its limits. Where a fix has no test, or a problem was not reproduced, the entry says so.
 - On a fresh copy of the final code: `zig build test` passed (137 and 1 skipped as 64-bit, 138 as 32-bit, 35 installer tests), the `fsread` package tests passed (7/7), formatting was clean, all 30 QEMU scripts passed, including the AArch64 and RISC-V Linux boots, and `tests/package-files.sh` passed. Disks installed by 0.0.4 (MBR and GPT images) and its removable-media loaders for all four architectures were upgraded without warnings about old data.
+- Salted passwords (CMN-04) came after that run. For release 0.0.5 it was all repeated on a fresh copy: 141 unit tests passed and 1 was skipped as 64-bit, 142 passed as 32-bit, plus 35 installer and 7 `fsread` tests; formatting, all 30 QEMU scripts and the package test passed.
 - Nothing has been tried on real hardware, and the installer has not written to a real disk or to firmware variables.
 
 ## Left to do
 
 - The parts listed as open in the partly fixed entries.
-- Design decisions: whether `password` without `restricted` should guard booting, as in LILO (CMN-03), and whether to replace the unsalted password hash, which would change the configuration format (CMN-04).

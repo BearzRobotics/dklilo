@@ -18,4 +18,11 @@ Only `std.Io.File.readPositional` is used. On a hosted OS pass a real `Io` and
 device (copy `std.Io.failing` and override it); see dklilo's
 `src/common/devio.zig` and `docs/std-io-freestanding.md` for the limits.
 
+Damaged metadata is an error, not a crash or a hang, as far as it is checked
+and tested; build with safety checks (`ReleaseSafe`) when reading untrusted
+disks. A volume using an incompatible feature the reader doesn't know is
+`error.Unsupported`. Journals and logs are not replayed:
+`fs.needsRecovery()` says when one is pending. btrfs file data checksums are
+not verified.
+
 Requires Zig 0.17.1. Tests against real mkfs images live in the dklilo repo.

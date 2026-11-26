@@ -65,8 +65,11 @@ on real hardware.
 * The FAT image writer (`src/installer/fat12.zig`) writes VFAT long names, which
   `BOOTRISCV64.EFI` needs (its base name is longer than 8 characters). Checked by
   a unit test and by reading the image back with `mtools`.
-* `thumb-uefi` and `riscv64` binaries are 125 KB and 323 KB (limit 512 KiB).
-  The RISC-V one is larger mostly because compiler-rt is bundled.
+* The loaders are built `ReleaseSafe`. In 0.0.5 they are about 190 KiB
+  (`thumb`), 235 KiB (AArch64), 250 KiB (x86_64) and 480 KiB (RISC-V), against
+  a limit of 512 KiB. The RISC-V one is larger mostly because compiler-rt is
+  bundled; to fit, it is also built without debug information, unwind tables
+  and frame pointers, which the other three don't need to be.
 
 ## edk2 RISC-V `virt`: the device tree gets overwritten (not a Zig issue)
 

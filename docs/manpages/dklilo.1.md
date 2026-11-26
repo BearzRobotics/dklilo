@@ -6,6 +6,8 @@ dklilo - install and check the dklilo boot loader
 
 **dklilo check** [*conf*] [**--device** *DEV*]
 
+**dklilo password** [**--iterations** *N*]
+
 **dklilo install-bios** *disk* [**--config-partition** *N*|**none**] [**--force**] [**--yes**]
 
 **dklilo install-uefi** *esp-dir* [**--arch** *ARCH*] [**--removable** [**--force**]] [**--entry-file** *FILE*] [**--device** *DEV*] [**--yes**]
@@ -48,9 +50,9 @@ System Partition, list the writes first and ask for confirmation (see
     loader. `iso` entries are mounted and checked inside the ISO. Chainload
     (`other`) entries are listed but not verified. An empty kernel is an
     error; an empty initramfs, or a kernel that is neither a bzImage nor an
-    EFI program, is a warning. It also fails on a password no one could type
-    and a command line too long for the loader, and warns about passwords
-    that protect less than they seem to, repeated keys, and a `root=LABEL=`
+    EFI program, is a warning. It also fails on a password hash that nothing
+    could match and a command line too long for the loader, and warns about
+    unsalted password hashes, passwords that protect less than they seem to, repeated keys, and a `root=LABEL=`
     or `root=UUID=` on an entry without `initrd`. A configuration with no
     entries is accepted.
 
@@ -63,6 +65,18 @@ System Partition, list the writes first and ask for confirmation (see
     the configuration is searched for on that disk the way the boot loader
     searches (see FILES in **dklilo.conf**(5)), only that disk is read, and
     *conf* is not used.
+
+**password** [**--iterations** *N*]
+:   Asks for a password (twice, without showing it, when typed at a terminal;
+    otherwise it reads one line of standard input) and prints the `password =`
+    line for **dklilo.conf**(5): PBKDF2 with HMAC-SHA-256, a random salt and
+    *N* iterations (default 300000, at most 5000000). More iterations make
+    guessing slower and the boot menu's check slower by the same amount; the
+    default takes about 2 seconds in the BIOS loader under unaccelerated
+    QEMU. The password must be 1 to 256 printable ASCII characters, which is
+    what can be typed at the menu. **Update the installed boot loader before
+    using the line**: loaders older than 0.0.5 treat it as a broken
+    configuration, which brings up a prompt without a password.
 
 **install-bios** *disk* [**--config-partition** *N*|**none**] [**--force**] [**--yes**]
 :   Installs stage 1 into the MBR boot code of *disk* and stage 2 into the gap
@@ -199,6 +213,9 @@ System Partition, list the writes first and ask for confirmation (see
 **--no-windows**
 :   (**config**) Do not add a Windows entry even if one is detected.
 
+**--iterations** *N*
+:   (**password**) How much work each check of the password takes.
+
 Options are matched by exact spelling; the `--option=value` form is not
 
 supported. Disks may be given as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX` or any
@@ -309,11 +326,15 @@ It writes only the locations it lists beforehand, and refuses to overwrite
 
 unrecognised data in the stage 2 area. The boot menu password in
 
-`dklilo.conf` is stored as a SHA-256 hash; it protects editing the kernel
+`dklilo.conf` is stored as a salted, slow hash (see **password**; the older
 
-command line in the menu only, not the files on disk. dklilo does not support
+unsalted SHA-256 is still accepted). It guards editing the command line of
 
-Secure Boot.
+`restricted` entries and booting by hand from the menu. It does not guard
+
+booting an entry as written, the prompt shown when there is no usable
+
+configuration, or the files on disk. dklilo does not support Secure Boot.
 
 # COMPATIBILITY
 

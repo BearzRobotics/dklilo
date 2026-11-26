@@ -39,13 +39,16 @@ other   = windows                # finds Windows automatically
   and ISO 9660 with Rock Ridge.
 - **Boots Windows** by chainloading Windows Boot Manager (UEFI) or the Windows
   partition's boot sector (BIOS).
-- **Text menu** with a timeout, a default entry, a command-line editor and
-  optional password protection. It works on screen and over a serial console.
+- **Text menu** with a timeout, a default entry, a command-line editor, a way
+  to boot a kernel by hand, and optional password protection with a salted
+  hash. It works on screen and over a serial console, and after a failed boot
+  it waits for you.
 - **Hybrid ISO and loopback ISO boot:** boots from DVD or USB on both
   firmware types, or boots an ISO file stored on another filesystem
   (`iso = /isos/rescue.iso`).
-- **Installer** that shows every write first and refuses to overwrite a boot
-  loader or data it doesn't recognise.
+- **Installer** that shows what it will write before it writes to a disk or
+  an ESP, and refuses to overwrite a boot loader or data it doesn't
+  recognise.
 - **No dependencies, no C, no separate assembler.** The only non-ordinary-Zig
   parts are the 16-bit real-mode stubs, written as `.code16` assembly blocks
   in `.zig` files.
@@ -55,6 +58,36 @@ other   = windows                # finds Windows automatically
 Secure Boot, graphical menus, encrypted `/boot` (LUKS), `/boot` on LVM or
 software RAID, btrfs RAID0/5/6, NTFS/XFS readers, network boot, Multiboot,
 32-bit x86 kernels, and BIOS on anything but x86. See [SPEC.md](SPEC.md) section 2.
+
+## Requirements
+
+- **BIOS:** an x86 PC with about 41 MiB of RAM or more and 512-byte disk
+  sectors. A kernel's protected-mode part may be up to 29 MiB. Stage 2 needs
+  about 480 free sectors before the first partition (the usual 1 MiB gap is
+  plenty) or, on GPT, a BIOS boot partition at least that big.
+- **UEFI:** Secure Boot off.
+
+## Upgrading from 0.0.4
+
+Install the new `dklilo`, then run the same `install-bios` or `install-uefi`
+command again: existing configurations and installations work as they are.
+Things that behave differently:
+
+- After a failed boot the menu waits for a key instead of retrying. `m` boots
+  a kernel by hand, and asks for the password if one is set.
+- `dklilo password` makes a salted password hash. **Update the installed boot
+  loader before putting one in `dklilo.conf`:** older loaders treat the file
+  as broken and show a prompt without a password. Old hashes keep working.
+- `dklilo check` fails on more problems: an empty kernel, a chainload
+  partition that doesn't exist, a password hash nothing matches, or a command
+  line too long to pass on.
+- `install-uefi` refuses an ESP that isn't mounted; `isohybrid` asks before
+  writing to a disk.
+- `UUID=` no longer matches FAT volumes (use `LABEL=`), as the manual always
+  said. Filesystems with unknown incompatible features are not read.
+
+[docs/bugs](docs/bugs/README.md) records the 0.0.4 defects that were found,
+what fixes each one, and what is still open.
 
 ## Building
 
@@ -72,9 +105,11 @@ binary (static, no libc).
 
 ## Installing
 
-Every command lists its writes first and needs `--yes` or an interactive
-confirmation. `install-bios` takes a whole disk and refuses targets that don't
-look like one. `install-uefi --removable` replaces another system's loader
+`install-bios` and `install-uefi` list their writes first and need `--yes` or
+an interactive confirmation (so does `isohybrid` when it is given a disk).
+`install-bios` takes a whole disk and refuses targets that don't look like
+one, and records which partition holds `dklilo.conf`
+(`--config-partition` chooses it). `install-uefi --removable` replaces another system's loader
 only with `--force`; see [the manual](docs/manpages/dklilo.1.md).
 
 ```sh
@@ -84,6 +119,9 @@ dklilo config -o /boot/dklilo.conf
 # Check it: parses the config and confirms every image/initrd exists,
 # using the same filesystem code as the boot loaders
 dklilo check /boot/dklilo.conf
+
+# Optional: a password line for dklilo.conf
+dklilo password
 
 # BIOS: stage 1 into the MBR, stage 2 into the post-MBR gap or BIOS boot partition
 dklilo install-bios /dev/sda
@@ -101,6 +139,7 @@ Disks can be named as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX`, or any
 |---|---|
 | `dklilo check [conf]` | Validates the config against the real filesystems. |
 | `dklilo config` | Writes a first `dklilo.conf`. |
+| `dklilo password` | Prints a `password =` line with a salted hash. |
 | `dklilo install-bios <disk>` | Installs the BIOS loader. |
 | `dklilo install-uefi <esp>` | Installs the UEFI loader and boot entry. |
 | `dklilo mkiso-images <dir>` | Writes `eltorito.bin`, `efiboot.img` and `mbr.bin` for building a hybrid ISO. |
@@ -147,12 +186,18 @@ tests/run-all.sh
 ```
 
 Unit tests run against disk images created by the real `mkfs.ext4`,
-`mkfs.btrfs` and `mkfs.fat`. The QEMU boot tests (`tests/qemu/`) boot a real
-kernel through SeaBIOS and OVMF for each firmware, partition table and
-filesystem combination, and need `qemu-system-x86_64`, OVMF, `xorriso`, and a
-stock distribution kernel at `$DKLILO_KERNEL` (default
-`~/.cache/dklilo/vmlinuz`). Tests skip when something is missing. Windows
-chainloading is tested against a stub, and by hand against a real Windows VM.
+`mkfs.btrfs` and `mkfs.fat`. The test scripts in `tests/qemu/` boot through
+SeaBIOS and OVMF (and AAVMF and RISC-V edk2) or drive the `dklilo` tool on
+disk images; none of them touches a real disk. Between them they use
+`qemu-system-x86_64` (also `-aarch64` and `-riscv64`), the matching firmware,
+`xorriso`, `mtools`, `sfdisk`, `sgdisk`, `debugfs`, `python3` and GNU `as`.
+Many use fake kernels. The Linux boot tests need a distribution kernel at
+`$DKLILO_KERNEL` (default `~/.cache/dklilo/vmlinuz`), and
+`$DKLILO_KERNEL_AA64` and `$DKLILO_KERNEL_RISCV64` for the other
+architectures. Tests skip when something is missing, and the runner lists what
+it skipped. `tests/package-files.sh` checks that the files `build.zig.zon`
+lists are enough to build. Windows chainloading is tested against a stub, and
+by hand against a real Windows VM.
 
 ## Documentation
 
@@ -162,6 +207,8 @@ chainloading is tested against a stub, and by hand against a real Windows VM.
   kernel.
 - [docs/manpages/dklilo.conf.5.md](docs/manpages/dklilo.conf.5.md): configuration reference.
 - [docs/manpages/dklilo.1.md](docs/manpages/dklilo.1.md): the `dklilo` command.
+- [docs/bugs](docs/bugs/README.md): the bug hunt of 0.0.4 and what was done
+  about each finding.
 - [docs/zig-uefi-targets.md](docs/zig-uefi-targets.md): which UEFI targets Zig 0.17.1 can build.
 - [docs/std-io-freestanding.md](docs/std-io-freestanding.md): limits of `std.Io` on freestanding targets.
 - [deps/fsread](deps/fsread): the filesystem readers, reusable as a package.
@@ -171,7 +218,8 @@ chainloading is tested against a stub, and by hand against a real Windows VM.
 ## Status
 
 Pre-release. The milestones through the ISO and loopback-ISO work are
-implemented (see SPEC.md section 9). Each release is meant to be booted on at
+implemented (see SPEC.md section 9), and the known defects are listed in
+[docs/bugs](docs/bugs/README.md). Each release is meant to be booted on at
 least one BIOS-only and one UEFI machine before it is tagged. dklilo isn't
 signed, so Secure Boot must be off.
 

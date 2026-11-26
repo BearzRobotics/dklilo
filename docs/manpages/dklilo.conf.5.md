@@ -58,15 +58,25 @@ an ISO written to a stick).
     the UEFI loader the firmware's console.
 
 `password = HASH`
-:   The hexadecimal SHA-256 of the password needed to edit the command line
-    of `restricted` entries, and to boot by hand from the menu. Never store
-    the password itself; produce the hash with
-    `printf %s 'secret' | sha256sum`. A password may be up to 256 characters.
+:   A hash of the password needed to edit the command line of `restricted`
+    entries, and to boot by hand from the menu. Never store the password
+    itself. `dklilo password` makes the line:
+
+        password = pbkdf2-sha256$300000$<salt>$<hash>
+
+    This is PBKDF2 with HMAC-SHA-256: iterations (1 to 5000000), a salt of 8
+    to 64 bytes and a 32-byte hash, the last two in hexadecimal. The older
+    form, 64 hexadecimal digits holding the SHA-256 of the password
+    (`printf %s 'secret' | sha256sum`), is still accepted; it is unsalted and
+    quick to guess, and `dklilo check` says so. Boot loaders older than 0.0.5
+    know only the older form: with the newer one they treat the whole file as
+    broken and prompt without a password. A password may be up to 256
+    characters. After a wrong one the menu pauses.
 
     Unlike LILO's, it does not guard booting an entry as written. With no
     `restricted` entry, anyone can edit command lines; `dklilo check` warns.
     It also does not protect the prompt shown when there is no usable
-    configuration.
+    configuration, which includes a broken one.
 
 ## ENTRY KEYS
 

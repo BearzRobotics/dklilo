@@ -23,15 +23,18 @@ command proves a configuration with the code that will boot it.
 1. **Firmware** loads sector 0 of the boot disk to `0x7C00` and jumps there
    with the drive number in `dl`. That sector is **stage 1**.
 2. **Stage 1** forces `cs = 0`, then reads stage 2 with `int 13h` extended
-   reads. Where stage 2 lives is the only block list dklilo keeps: one
+   reads (retrying a failed one, and refusing to jump into anything that
+   doesn't carry stage 2's signature). Where stage 2 lives is the only block list dklilo keeps: one
    extent (a 64-bit LBA and a 16-bit sector count) at MBR offset 416, written
    by `dklilo install-bios`. Stage 2 is loaded at `0x8000` and entered with
    `dl` still holding the drive.
-3. **Stage 2's first code** (`realmode.zig`) enables A20 through port `0x92`,
-   loads a flat GDT and sets `CR0.PE`. From here the CPU runs flat 32-bit
+3. **Stage 2's first code** (`realmode.zig`) makes sure A20 is on (if it
+   isn't, it tries the BIOS call, the keyboard controller and port `0x92`,
+   testing after each), loads a flat GDT and sets `CR0.PE`. From here the CPU runs flat 32-bit
    code and Zig takes over. `stage2_early` runs first, on a temporary stack
-   in low memory: it checks the E820 map for RAM where the stack and heap go,
-   and stops with "not enough memory" if there is none. Then `stage2_main`.
+   in low memory: it checks that there is enough conventional memory, and
+   the memory map (E820, or one made from older BIOS calls) for RAM where the
+   stack and heap go, and stops with a message if not. Then `stage2_main`.
 4. **BIOS services** are still needed for the disk, keyboard and screen. The
    trampoline `bios_int(vec)` drops to real mode (via a 16-bit protected-mode
    segment, so the segment limits are right), runs `int vec` with registers
@@ -45,18 +48,22 @@ command proves a configuration with the code that will boot it.
    volumes, then `/boot/dklilo.conf` and `/dklilo.conf`. No configuration, or a broken one,
    leads to a prompt where a kernel path and command line can be typed.
 6. **The menu** draws on the screen and on COM1 at the same time and reads
-   keys from both.
+   keys from both. `m` asks for a kernel path and command line (after the
+   password, if there is one). Once a boot has failed or returned, the menu
+   always waits for a key.
 7. **Linux** (`bootLinux`): read the setup header from the kernel file,
    require boot protocol 2.10 or newer; read the protected-mode kernel
    straight from the filesystem to `0x100000`; place the initramfs as high as
-   `initrd_addr_max` and the `E820` memory map allow; fill in `boot_params`
+   `initrd_addr_max` and the memory map allow, above where the kernel will
+   unpack itself; refuse a kernel that doesn't fit; fill in `boot_params`
    (`src/common/linux/bootparams.zig`) at `0x90000` with the command line at
    `0x91000`; then `jump_kernel`: interrupts off, `cs = 0x10`, `ds/es/ss =
    0x18`, `esi = boot_params`, jump to `code32_start`. The kernel switches to
    64-bit mode itself.
 8. **Windows** (`chainload`): load the Windows partition's boot sector to
-   `0x7C00` with a copy of its MBR partition entry at `0x7BE`, return to real
-   mode and `jmp 0000:7C00` with `dl` set to the drive.
+   `0x7C00` (if it ends in `0x55AA`) with a copy of its MBR partition entry
+   at `0x7BE`, return to real mode and `jmp 0000:7C00` with `dl` set to the
+   drive.
 
 ### From a CD or a USB stick
 
@@ -86,11 +93,20 @@ same stage 2 copy inside the ISO.
    image's load options (UTF-16), and the initramfs is offered through a
    `LoadFile2` protocol installed on a handle whose device path carries the
    `LINUX_EFI_INITRD_MEDIA_GUID`. This is the interface kernels since 5.8 use;
-   it needs a kernel built with `CONFIG_EFI_STUB`.
-5. **Windows**: `\EFI\Microsoft\Boot\bootmgfw.efi` is found on whichever FAT
-   volume the firmware exposes, then started with `LoadImage` from its *device
+   it needs a kernel built with `CONFIG_EFI_STUB`. If the kernel returns, or
+   can't be started, the protocol is removed again.
+5. **Windows**: `\EFI\Microsoft\Boot\bootmgfw.efi` is looked for on the FAT
+   volume dklilo came from, then the rest of that disk, then other disks that
+   the firmware exposes, and started with `LoadImage` from its *device
    path* (not from memory), because boot managers locate their own volume
    from it.
+
+## When something is wrong
+
+The loaders and the tool are built `ReleaseSafe`. If a safety check fails,
+the BIOS loader prints `dklilo: internal error: ...` and halts; the UEFI
+loader prints it and returns to the firmware, which can try its next boot
+option.
 
 ## Memory map (BIOS)
 

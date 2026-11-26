@@ -204,7 +204,7 @@ them belong to it.
 | `default` | Label of the default entry. Absent means the first entry. |
 | `prompt` | Always show the menu, even with one entry. |
 | `serial` | `port,baud` for a serial console, used alongside the screen. |
-| `password` | Optional password required to edit a command line (stored as a SHA-256 hash, never plain text). |
+| `password` | Optional password required to edit the command line of a `restricted` entry, and to boot by hand from the menu. Only a hash is stored: PBKDF2-HMAC-SHA-256 with a salt (`dklilo password`), or, as before, an unsalted SHA-256. It deliberately does not guard booting an entry as written (unlike LILO), so a machine can always boot unattended. |
 
 **Entry keys:**
 
@@ -297,10 +297,12 @@ All readers are read-only and never write to the disk.
 | Command | Does |
 |---|---|
 | `dklilo check [conf]` | Parses the configuration and, using the same filesystem code as the loaders, confirms every `image` and `initrd` exists and every label is unique. |
-| `dklilo install-bios <disk>` | Writes stage 1 to the MBR (keeping the partition table and disk signature) and stage 2 to the post-MBR gap or the GPT BIOS boot partition. |
+| `dklilo password` | Prints a `password =` line holding a salted PBKDF2 hash of a password read from the terminal or standard input. |
+| `dklilo install-bios <disk>` | Writes stage 1 to the MBR (keeping the partition table and disk signature) and stage 2 to the post-MBR gap or the GPT BIOS boot partition, and records the configuration's partition (5.3; `--config-partition`). |
 | `dklilo install-uefi <esp>` | Copies `dkliloX64.efi` to `\EFI\dklilo\` and creates a boot entry by writing the `Boot####` and `BootOrder` variables through `/sys/firmware/efi/efivars`. `--removable` installs to `\EFI\BOOT\BOOTX64.EFI` instead, for USB sticks. |
 | `dklilo config [-o FILE]` | Writes a first `dklilo.conf` from `/boot` (kernels paired with initramfs files), the root `PARTUUID`, btrfs subvolume (`subvol=`, `rootflags=`) and Windows detection. Refuses to overwrite without `--force`. |
 | `dklilo mkiso-images <dir>` | Writes `eltorito.bin` and a FAT EFI image into a directory, ready for `xorriso` to build a hybrid ISO. |
+| `dklilo isohybrid <iso>` | Points stage 1 of a hybrid ISO at the stage 2 inside it. Asks first when given a disk. |
 
 - Disks can be named as `/dev/sdX`, `/dev/nvmeXnY`, `/dev/vdX`, or any
   `/dev/disk/by-id/…`, `by-uuid`, `by-label` or `by-partuuid` path,
@@ -480,7 +482,11 @@ Details settled while building L0-L3 that the sections above leave open.
   offset 416, so stage 1 code must end before byte 416. On GPT disks stage 2
   lives in a BIOS boot partition (type `21686148-6449-6E6F-744E-656564454649`).
 - **Menu.** A single entry with `timeout` set boots without showing the menu
-  unless `prompt` is given. `timeout = 0` always boots immediately.
+  unless `prompt` is given. `timeout = 0` always boots immediately. Neither
+  applies after a boot has failed or returned: the menu then waits for a key.
+- **Password hashes** are in `src/common/password.zig`. The default 300000
+  PBKDF2 iterations took about 2 s in the BIOS loader under QEMU without
+  acceleration; no real hardware has been timed.
 - **Console.** BIOS mirrors screen and COM1 (115200 8N1) and reads both; on
   UEFI the firmware's console already includes serial. `serial =` is parsed
   but only BIOS COM1 at 115200 is used so far.

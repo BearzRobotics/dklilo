@@ -177,12 +177,6 @@ Lines 741-750: truncate-and-write can leave an empty config. Without `--force`, 
 
 A 0-byte "kernel" passed with "all files found". Code review: no bzImage/EFI check, initrd count (BIOS-08), chain targets (BIOS-05) or password consistency (CMN-03). It reads the raw device under a mounted filesystem, so unflushed or journal-only changes can give wrong answers.
 
-**Fixed:** an empty kernel is an error; an empty initramfs, and a kernel that is neither a bzImage nor an EFI program, are warnings; passwords and command-line length are checked (CMN-03, CMN-10); only regular files count (CMN-12); and `check` syncs before reading a mounted disk.
-
-**Regression test:** `tests/qemu/l6-check.sh`.
-
-**Open:** chainload targets are not verified (BIOS-05), the initrd count is not checked (BIOS-08), and a journal that has not been replayed can still hide a recent change.
-
 **Fixed:** an empty kernel is an error; an empty initramfs, and a kernel that is neither a bzImage nor an EFI program, are warnings; passwords, command-line length and chainload targets are checked (CMN-03, CMN-10, BIOS-05); only regular files count (CMN-12); there is no initrd limit left to check (BIOS-08); and `check` syncs before reading a mounted disk.
 
 **Regression test:** `tests/qemu/l6-check.sh`.
