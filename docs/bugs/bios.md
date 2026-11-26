@@ -46,44 +46,74 @@
 **Still open:** the run-address check starts at 16 MiB and ignores `pref_address` (BIOS-04). Not tested on real hardware.
 
 ## BIOS-04: `kernel_end` ignores `pref_address`
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 `stage2.zig:142-144` assumes a relocatable kernel runs at 16 MiB. The boot protocol derives the runtime start from `pref_address` for non-relocatable kernels, and a kernel may prefer a higher address. The initramfs can then be placed where decompression overwrites it. `kernel_alignment` is also passed to `alignForward` without a power-of-two check.
 
+**Fix (applied):** the run address now follows the boot protocol (`pref_address`, relocatable or not, with a bad alignment ignored), still no lower than 16 MiB for a relocatable kernel, and the sums saturate. The line numbers above describe release 0.0.4.
+
+**Regression tests:** a kernel preferring 200 MiB in `l3-bios-memory.sh` (the old loader started it with 64 MiB of RAM) and a unit test.
+
 ## BIOS-05: `other = /dev/sdb1` chainloads partition 1 of the boot disk
-**Severity:** High · **Status:** Code review
+**Severity:** High · **Status:** Partly fixed (reproduced first)
 
 `stage2.zig:189-197` keeps only the trailing digits. The disk name is discarded, so the wrong OS can start. SPEC 5.6 says the installer resolves such names; no code does. `check` reports every chain entry `ok` unverified.
 
-**Fix:** keep accepting these names, but resolve them at check/install time to a stable identifier, or reject what cannot be honoured.
+**Fixed:** the loader accepts only a number or a name under `/dev/` (it used to take any trailing digits), and for a `/dev` name says which partition of the boot disk it is starting. `check` fails if the partition doesn't exist, and warns that the disk in a `/dev` name isn't checked. On the running system, when it can open the disks, it compares them and fails if they differ.
+
+**Regression tests:** `tests/qemu/l3-bios-hardening.sh` and `l6-check.sh`. The comparison of real disks needs root and was not run.
+
+**Open:** the loader still can't tell which disk a `/dev` name means, so someone who doesn't run `check` can still get the boot disk's partition, now with a message.
 
 ## BIOS-06: Chainload does not check the boot signature
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 `stage2.zig:202-222` jumps to any 512 bytes, including zeros, without testing `0x55AA`. The LBA and length casts to `u32` (218-220) are also unchecked for partitions beyond 2 TiB.
 
+**Fix (applied):** a sector without `0x55AA` is not started, and a partition starting beyond 32-bit sector numbers is refused. The line numbers above describe release 0.0.4.
+
+**Regression test:** `tests/qemu/l3-bios-hardening.sh`, "a partition without a boot sector isn't started". The 32-bit limit is not tested.
+
 ## BIOS-07: Promised configuration-partition record does not exist
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 SPEC 5.3 says the installer records the config partition (GUID, or MBR signature and number). `plan.zig` writes only the stage 2 block list. Stage 2 takes the first matching file in scan order, so multi-boot disks can load another installation's config.
 
+**Fix (applied):** `install-bios` records the partition (GPT GUID, or MBR signature and number) inside stage 2, and the BIOS loader looks there first, then searches as before, saying so. The installer chooses among several configurations as the manual describes; `--config-partition N|none` overrides it. The line numbers above describe release 0.0.4.
+
+**Regression tests:** `tests/qemu/l3-bios-config-record.sh` (MBR and GPT), whose cases that need a record failed before, and unit tests for the format and the choice.
+
+**Behaviour to know about:** after moving the configuration to another partition, run `install-bios` again; until then the loader finds it by searching unless the old partition still has one. The choice by mounted filesystem was tested with a made-up mount table on an image, not on real disks.
+
 ## BIOS-08: More than eight initrds fails
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 `stage2.zig:134-135` has a fixed array of 8 and returns `NotFound` with no message. UEFI and `check` have no such limit.
 
+**Fix (applied):** the list of initramfs files comes from the heap, with a message if that fails. The line numbers above describe release 0.0.4.
+
+**Regression test:** nine files in `tests/qemu/l3-bios-hardening.sh`, checking the length and checksum the kernel receives.
+
 ## BIOS-09: A20 is enabled one way and never verified
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (by review and throwaway builds)
 
 `realmode.zig:103-106` only uses port `0x92`. There is no wrap test and no `int 15h AX=2401h` or keyboard-controller fallback. On hardware where it fails, loads above 1 MiB alias.
 
+**Fix (applied):** A20 is tested first and left alone if open; otherwise the BIOS call, the keyboard controller and port `0x92` are tried in turn, testing after each, and failure is reported. The line numbers above describe release 0.0.4.
+
+**Tests:** QEMU leaves A20 open, so the suite only covers that case. In throwaway builds that closed A20 first, boot succeeded with all methods, with only the keyboard controller or only port `0x92` among the fallbacks, and with the BIOS call removed; with all three removed the message appeared. Not tested on hardware.
+
 ## BIOS-10: Direction flag is never cleared for Zig code
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first, with a test option ROM)
 
 Neither `_start` nor the return from `bios_int` runs `cld`; only `jump_kernel` does. The x86 C ABI requires DF=0, and the BIOS is not guaranteed to leave it clear.
 
+**Fix (applied):** `cld` on entry and after every BIOS call. The line numbers above describe release 0.0.4.
+
+**Regression test:** a BIOS that returns with DF set, in `tests/qemu/l3-bios-hardening.sh` (`bios-quirks.s`).
+
 ## BIOS-11: Smaller issues
-**Severity:** Low · **Status:** Code review
+**Severity:** Low · **Status:** Partly fixed
 
 - `stage2.ld` assertion `ADDR(.text) + 0x400 <= 0x10000` is always true, so it does not keep real-mode code below 64 KiB.
 - The EBDA (`int 12h`) is not checked before using `0x88000-0x91800`.
@@ -94,3 +124,9 @@ Neither `_start` nor the return from `bios_int` runs `cld`; only `jump_kernel` d
 - `serial =` is parsed and ignored (COM1, 115200). A CR LF terminal sends two Enters.
 - A failed E820 gives the kernel an empty map, with no fallback.
 - An empty initrd with total size 0 forms a pointer to address 0 (`stage2.zig:155-161`).
+
+**Fixed, with a test that failed first** (`tests/qemu/l3-bios-hardening.sh`): too little conventional memory is reported; stage 1 retries reads and refuses what isn't stage 2; a cut command line is reported; and a BIOS without E820 gets a map built from older calls, so the kernel still boots.
+
+**Fixed, not tested by a new failing case:** the linker script now checks where the real-mode code really ends; an empty initramfs no longer forms a pointer to address 0; long messages are cut, not dropped; the screen scrolls; a CR LF from a serial terminal is one Enter. 0.0.4, given the E820 failure, said `not enough memory for the initramfs`: with no map it had nowhere to put one.
+
+**Open:** `serial =` is still ignored.

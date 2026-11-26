@@ -89,7 +89,7 @@ These permit out-of-bounds access from disk values (tree blocks need only a vali
 **Regression tests:** `fat: an out-of-range first cluster is corrupt` and `fat32: an out-of-range root cluster is corrupt`. Both panicked on the old reader.
 
 ## FS-08: Other hangs from corrupt metadata
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (partly reproduced)
 
 - btrfs: child level is not required to be parent level minus one (`btrfs.zig:467-499`). A self-referencing node is bounded only in depth, so a wide walk is exponential.
 - ISO 9660: any number of `CE` entries per area, recursion depth 4 (`iso9660.zig:183-192`): exponential reads.
@@ -97,36 +97,66 @@ These permit out-of-bounds access from disk values (tree blocks need only a vali
 
 A related hang, a file read at block 2^32, was fixed with FS-01. The three items above are open. The FS-04 fix narrows the third: a directory can now be no bigger than the filesystem's block count, which is itself a value from the disk.
 
+**Fix (applied):** a btrfs child must be exactly one level below its parent, begin with the key its parent names, and be named only once (keys rise strictly). One ISO directory record may chain at most 32 continuation areas. A hole in an ext4 directory is `error.Corrupt`. The line numbers above describe release 0.0.4.
+
+**Reproduced:** the ISO case (the old reader worked through about 390,000 areas for one record and then reported success) and the ext4 directory hole (stepped over, reporting `NotFound`).
+
+**Not reproduced:** the btrfs wide walk. A node that is its own child already hit the old depth limit at once; a crafted tree that is wide without being deep was not built. That test passes on both and only guards the new checks.
+
 ## FS-09: btrfs accepts stale or foreign tree blocks
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 `readNode` (`btrfs.zig:430-455`) checks address and CRC but not header `fsid`, the parent's `generation`, or the expected level. A lagging mirror or old block passes.
 
+**Fix (applied):** a tree block must carry this filesystem's metadata id and the level and generation its parent (or the superblock, or the subvolume's root item) names. A copy that fails gives way to its mirror. The line numbers above describe release 0.0.4.
+
+**Regression tests:** `btrfs: a tree block of another age or filesystem is not accepted`, and the guard `a stale copy of a tree block gives way to the good one`. All files in every btrfs test image still read back. A filesystem with a changed metadata UUID was not tested.
+
 ## FS-10: btrfs data has no mirror fallback
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Partly fixed (reproduced first)
 
 `readLogical` (`btrfs.zig:852-868`) reads only `phys[0]`, even after an I/O error. Data checksums are never verified. SPEC 5.4 promises fallback; SPEC 9a and the module header admit data is unverified.
 
+**Fixed:** data that can't be read is taken from another copy. Test: `btrfs: unreadable data is taken from the other copy`.
+
+**Open:** data checksums are not verified, so a copy that reads without error but is wrong is still used.
+
 ## FS-11: Unknown or unreplayed on-disk state is read silently
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 - ext4 rejects only three `incompat` bits (`ext4.zig:309`); `encrypt` and unknown bits are accepted.
 - btrfs ignores `incompat_flags` entirely.
 - ext4 `needs_recovery` is set but never read by any caller, so stale metadata after a crash is used without warning.
 - btrfs `log_root` is ignored, so recently fsynced files may be missing or old.
 
+**Fix (applied):** ext4 and btrfs refuse incompatible features outside a list of those the readers handle. An ext4 volume with the `encrypt` feature is still read; encrypted files and directories are `error.Unsupported`. When a journal or log is pending, both loaders warn before booting, and `check --device` warns. The line numbers above describe release 0.0.4.
+
+**Regression tests:** two unit tests in `tests.zig` and the unclean-filesystem case in `l6-check.sh`. The loaders' own warnings have no test.
+
+**Limit:** journals and btrfs logs are still not replayed, as the manual now says. A volume with a feature added by a future kernel is now refused, as the kernel's own rule requires.
+
 ## FS-12: ext4 checksum verification can be skipped
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Partly fixed (reproduced first)
 
 The header and manual say mismatches are never ignored, but `verifyDirBlock` returns success when the tail marker is damaged (`ext4.zig:657`); htree interior blocks are unchecked; extent `entries` is not limited to `max`, so entries outside the checksummed area are used (455,496).
 
+**Fixed:** with `metadata_csum`, a directory block without its checksum tail is a mismatch unless it is an index block of a hashed directory; and an extent node may not hold more entries than its declared room, which is what the checksum covers.
+
+**Regression tests:** `ext4: a directory block without its checksum tail is not trusted` and `ext4: more extents than a node has room for is corrupt`.
+
+**Open:** the separate checksum of hashed-directory index blocks is not verified. Those blocks supply only `.` and `..` to this reader (from the first one).
+
 ## FS-13: A failed read leaves a poisoned cache
-**Severity:** Low · **Status:** Code review
+**Severity:** Low · **Status:** Fixed (reproduced first)
 
 `ext4.zig:509-512` and `fat.zig:171-173` read into the cache buffer and keep the old tag on failure.
 
+**Fix (applied):** the cache is marked empty before its buffer is read into. The line numbers above describe release 0.0.4.
+
+**Regression tests:** one for ext2 indirect blocks and one for the FAT, using a disk that scribbles on the buffer when a read fails.
+
 ## FS-14: Compatibility bugs
-**Severity:** Medium · **Status:** Code review
+**Severity:** Medium · **Status:** Fixed (reproduced first)
 
 - ISO: one multi-extent file aborts the whole directory walk (`iso9660.zig:122`), hiding later entries.
 - ISO: the `SL` component CONTINUE flag is ignored, inserting a false `/` (199-222).
@@ -139,3 +169,7 @@ The header and manual say mismatches are never ignored, but `verifyDirBlock` ret
 - ext4: fast symlinks are detected by `i_blocks == 0`, which fails with an external xattr block.
 - Detection: a FAT volume smaller than about 68 KiB fails the btrfs probe with `OutOfRange` and is never tried as FAT (`fs.zig:37-49`).
 - LZO header says a missing end marker is accepted; the code returns `InputOverrun`.
+
+**Fix (applied):** each item above. Multi-extent and interleaved ISO files are now listed and refused only when read; `..` crosses a btrfs subvolume boundary but not above the subvolume a path started in; and the LZO comment was corrected to match the code. The line numbers above describe release 0.0.4.
+
+**Regression tests:** unit tests in `tests.zig` for each item, and one in `deps/fsread/src/iso9660.zig` for the split symlink component (run with `zig build test` in `deps/fsread`; not run on the old code). Interleaved ISO files have no test.
